@@ -1,11 +1,11 @@
-/* 并行对话 0.6.1 — 单页面后台生成。
+/* 并行对话 0.6.3 — 单页面后台生成。
  *
  * 不再为每个会话启动第二个酒馆页面（iframe）。切换对话时，只把正在进行的
  * 生成请求留在后台继续接收；切回该对话后，由酒馆原生流程把保存下来的响应
  * 重新走一遍（正则、变量脚本、保存都是原生逻辑）。不自行拼接提示词，不直接
  * 写聊天文件，不保存 API 密钥。
  */
-const VERSION = '0.6.1';
+const VERSION = '0.6.3';
 const KEY = '__PARALLEL_TAVERN_V2__';
 const MAX_SESSIONS = 3;
 const STORE = 'parallel-tavern.jobs.v1';
@@ -102,6 +102,29 @@ export function start({ settings, save, installProfiles }) {
     let replayArm = null;         // 切回后等待原生流程发起的那次请求
     let switching = false, reattachBusy = false, reattachTimer = null;
     let profile = null;
+    let switchingSince = 0;
+
+    // ----- 诊断记录：只记步骤、状态和报错位置，不记聊天内容、角色名或密钥 -----
+    const startedAt = Date.now();
+    const logs = [], errors = [];
+    const ids = new Map();
+    const sid = key => { if (!key) return '-'; if (!ids.has(key)) ids.set(key, 'S' + (ids.size + 1)); return ids.get(key); };
+    function log(step, detail) {
+        logs.push(detail === undefined ? [Date.now() - startedAt, step] : [Date.now() - startedAt, step, detail]);
+        if (logs.length > 150) logs.shift();
+    }
+    function logError(where, error) {
+        const stack = String(error?.stack || '').split('\n').slice(1, 4).map(line => line.trim().replace(/https?:\/\/[^/]+\//g, '').slice(0, 120));
+        errors.push({ at: Date.now() - startedAt, where, name: String(error?.name || 'Error'), message: String(error?.message || error).slice(0, 200), stack });
+        if (errors.length > 12) errors.shift();
+        log('error', where);
+    }
+    const onWindowError = event => { if (/parallel|runtime\.js/i.test(String(event.filename || event.error?.stack || ''))) logError('window', event.error || event.message); };
+    const onRejection = event => { if (/runtime\.js|character-profiles\.js/.test(String(event.reason?.stack || ''))) logError('promise', event.reason); };
+    host.addEventListener('error', onWindowError);
+    host.addEventListener('unhandledrejection', onRejection);
+    teardown.push(() => { host.removeEventListener('error', onWindowError); host.removeEventListener('unhandledrejection', onRejection); });
+    const withTimeout = (promise, ms, label) => Promise.race([Promise.resolve(promise), new Promise((_, reject) => host.setTimeout(() => reject(new Error(label + '超时')), ms))]);
 
     function on(name, fn) {
         if (!name || !emitter?.on) return;
@@ -122,6 +145,10 @@ export function start({ settings, save, installProfiles }) {
         if (doc.body.dataset.generating === 'true') return true;
         const stop = doc.getElementById('mes_stop');
         return !!stop && host.getComputedStyle(stop).display !== 'none';
+    }
+    function genState() {
+        const stop = doc.getElementById('mes_stop');
+        return { gen: doc.body.dataset.generating ?? null, stop: stop ? host.getComputedStyle(stop).display : 'missing', swiping: doc.body.dataset.swiping ?? null };
     }
     // 滑动生成被中断后，酒馆还要把滑动状态收尾；这期间不能切换聊天。
     const isSwiping = () => doc.body.dataset.swiping === 'true';
@@ -205,6 +232,7 @@ export function start({ settings, save, installProfiles }) {
     function finish(job, error) {
         if (job.status === 'running') job.status = 'done';
         job.finishedAt = Date.now();
+        log('job:finish', { s: sid(job.key), status: job.status, http: job.head?.status ?? null, bytes: job.bytes, attached: job.attached, error: error ? String(error.name || 'Error') : null });
         const front = job.front; job.front = null;
         if (front) { try { error ? front.error(error) : front.close(); } catch { /* 原生端已取消读取 */ } }
         if (error && !job.head) { job.failure = error; job.onFail?.(error); }
@@ -286,6 +314,7 @@ export function start({ settings, save, installProfiles }) {
     function intercept(arm, input, init) {
         const signal = init?.signal || (typeof input === 'object' ? input.signal : null);
         const sig = signature(input, init);
+        log(arm.replay ? 'fetch:replay' : 'fetch:track', { src: sig.src, stream: sig.stream });
         if (arm.replay) return replay(arm.replay, sig, signal);
         for (const old of [...jobs.values()]) if (old.attached && old.status !== 'running') drop(old);
         const info = arm.gen.info;
@@ -397,7 +426,11 @@ export function start({ settings, save, installProfiles }) {
         }
         return nativeFetch.apply(host, arguments);
     }
-    host.fetch = parallelFetch;
+    let fetchHooked = true;
+    try {
+        host.fetch = parallelFetch;
+        if (host.fetch !== parallelFetch) Object.defineProperty(host, 'fetch', { value: parallelFetch, configurable: true, writable: true });
+    } catch (error) { fetchHooked = false; console.warn('[并行对话] 无法接管 fetch，后台生成不可用', error); }
     teardown.push(() => { if (host.fetch === parallelFetch) host.fetch = nativeFetch; });
 
     on(events.GENERATION_STARTED, (type, _options, dryRun) => {
@@ -406,6 +439,7 @@ export function start({ settings, save, installProfiles }) {
         quietPending = 0;
         const info = current(), chat = ctx().chat, last = chat[chat.length - 1];
         gen = { type, info, cont: type === 'continue' && last ? { mes: String(last.mes ?? '') } : null };
+        log('gen:start', { type, s: sid(info.key) });
         queueRender();
     });
     on(events.GENERATE_AFTER_DATA, (_data, dryRun) => {
@@ -416,10 +450,12 @@ export function start({ settings, save, installProfiles }) {
         else if (gen.info.key && TYPES.includes(gen.type)) armed = { gen, until: Date.now() + 15000 };
     });
     const generationOver = () => { host.setTimeout(() => { settle(); queueRender(); }, 150); };
-    on(events.GENERATION_ENDED, generationOver);
-    on(events.GENERATION_STOPPED, generationOver);
-    on(events.CHAT_CHANGED, () => { syncCurrent(); restoreReading(curKey); queueRender(); scheduleReattach(400); });
-    on(events.APP_READY, () => { syncCurrent(); queueRender(); scheduleReattach(600); });
+    on(events.GENERATION_ENDED, () => { log('gen:ended'); generationOver(); });
+    on(events.GENERATION_STOPPED, () => { log('gen:stopped'); generationOver(); });
+    on(events.CHAT_CHANGED, () => { syncCurrent(); log('chat:changed', { s: sid(curKey) }); restoreReading(curKey); queueRender(); scheduleReattach(400); });
+    // 酒馆对 APP_READY 的“晚到订阅者”会在 on() 里立刻同步回调；扩展加载得比酒馆就绪晚时，
+    // 那一刻本函数后面的变量还没初始化，所以这里一律推迟到下一个任务再处理。
+    on(events.APP_READY, () => host.setTimeout(() => { if (disposed) return; syncCurrent(); queueRender(); scheduleReattach(600); }, 0));
 
     // ----- 转入后台 / 切回 -----
     async function detach(job) {
@@ -429,13 +465,15 @@ export function start({ settings, save, installProfiles }) {
             return false;
         }
         job.detaching = true;
+        log('detach:start', { s: sid(job.key), type: job.type, bytes: job.bytes });
         let ended = false;
         const onEnded = () => { ended = true; };
         emitter.on(events.GENERATION_ENDED, onEnded);
         try {
             ctx().stopGeneration();
             await waitFor(() => ended, 1200);
-            await waitFor(() => !isGenerating() && !isSwiping(), 8000);
+            const idle = await waitFor(() => !isGenerating() && !isSwiping(), 8000);
+            if (!idle) log('detach:still-busy', genState());
             if (job.type === 'swipe') { await delay(150); await waitFor(() => !isSwiping(), 5000); }
             const c = ctx(), chat = c.chat, last = chat[chat.length - 1];
             if (current().key === job.key && last && !last.is_user) {
@@ -456,6 +494,7 @@ export function start({ settings, save, installProfiles }) {
             job.attached = false; job.detaching = false; job.front = null; job.onHead = null; job.onFail = null;
         }
         if (job.status !== 'running') { const session = sessions.get(job.key); if (session?.job === job) session.unread = true; persist(); }
+        log('detach:done', { s: sid(job.key), created: job.created, status: job.status });
         queueRender();
         return true;
     }
@@ -501,13 +540,23 @@ export function start({ settings, save, installProfiles }) {
             } else if (job.created) {
                 if (marked && chat.length === job.baseLength + 1) mode = 'regenerate';
             } else if (chat.length === job.baseLength) mode = last?.is_user ? 'regenerate' : 'normal';
+            log('reattach', { s: sid(job.key), type: job.type, mode, created: job.created, marked, len: chat.length, base: job.baseLength, status: job.status });
             if (!mode) {
                 job.mismatch = true; session.unread = true;
                 notify(`「${job.name}」的聊天内容已有变化，后台回复没有自动写入。可在并行面板里复制文本或丢弃。`);
                 render(); return;
             }
             session.unread = false;
-            replayArm = { job, draft: '', timer: host.setTimeout(() => { if (replayArm?.job === job) { releaseReplay(); queueRender(); } }, 30000) };
+            replayArm = { job, draft: '', timer: host.setTimeout(() => { if (replayArm?.job === job) { log('reattach:expired'); releaseReplay(); queueRender(); } }, 30000) };
+            // 原生生成若 6 秒内没有启动（按钮被别的界面挡住、酒馆拒绝等），不要一直挡着切换。
+            const arm = replayArm;
+            host.setTimeout(() => {
+                if (replayArm !== arm || job.attached || isGenerating()) return;
+                log('reattach:not-started', genState());
+                releaseReplay(); job.mismatch = true; session.unread = true;
+                notify(`「${job.name}」的后台回复没能自动写入，可在并行面板里复制文本，或丢弃后重新生成。`);
+                render();
+            }, 6000);
             trigger(mode);
             queueRender();
         } finally { reattachBusy = false; }
@@ -529,26 +578,41 @@ export function start({ settings, save, installProfiles }) {
         }
     }
     async function openSession(target) {
-        if (switching || disposed) return;
-        switching = true;
+        if (disposed) return;
+        if (switching) {
+            // 上一次切换若超过 20 秒还没结束，视为卡死并放行，避免之后所有点击都没反应。
+            if (Date.now() - switchingSince < 20000) { log('switch:ignored-busy'); notify('正在切换，请稍等。'); return; }
+            log('switch:force-reset');
+        }
+        switching = true; switchingSince = Date.now();
+        const known = target.chatId ? target.avatar + '\n' + target.chatId : [...sessions.keys()].find(key => key.startsWith(target.avatar + '\n'));
+        log('switch:start', { to: known ? sid(known) : 'new', chat: !!target.chatId, ...genState() });
         try {
             recordReading();
             const now = current();
-            if (now.avatar === target.avatar && (!target.chatId || now.chatId === target.chatId)) { panelOpen = false; pickerOpen = false; render(); scheduleReattach(50); return; }
-            if (replayArm) { notify('正在写回后台回复，请稍等一下再切换。'); return; }
+            if (now.avatar === target.avatar && (!target.chatId || now.chatId === target.chatId)) { log('switch:already-here'); panelOpen = false; pickerOpen = false; render(); scheduleReattach(50); return; }
+            if (replayArm) { log('switch:blocked-replay'); notify('正在写回后台回复，请稍等几秒再切换。'); return; }
             if (isGenerating()) {
                 const job = foregroundJob();
-                if (!job) { notify('当前这次生成无法转入后台（群聊、扩展自己的请求或不支持的接口）。请等待完成或先停止。'); return; }
-                if (!(await detach(job))) return;
+                if (!job) { log('switch:blocked-untracked', genState()); notify('当前这次生成无法转入后台（群聊、扩展自己的请求或不支持的接口）。请等待完成或先停止。'); return; }
+                if (!(await detach(job))) { log('switch:detach-refused'); return; }
             }
             const c = ctx();
             const index = c.characters.findIndex(character => character?.avatar === target.avatar);
-            if (index < 0) { notify('没有找到这个角色，请先刷新角色列表。'); return; }
+            if (index < 0) { log('switch:no-character'); notify('没有找到这个角色，请先刷新角色列表。'); return; }
             panelOpen = false; pickerOpen = false; render();
-            if (c.groupId || String(c.characterId) !== String(index)) await c.selectCharacterById(index, { switchMenu: false });
-            if (current().avatar !== target.avatar) { notify('酒馆没有完成切换，请稍后再试。'); return; }
-            if (target.chatId && current().chatId !== target.chatId) await c.openCharacterChat(target.chatId);
+            if (c.groupId || String(c.characterId) !== String(index)) {
+                log('switch:select');
+                await withTimeout(c.selectCharacterById(index, { switchMenu: false }), 15000, '打开角色');
+            }
+            if (current().avatar !== target.avatar) { log('switch:not-switched', genState()); notify('酒馆没有完成切换（可能还在保存或生成），请稍后再试。'); return; }
+            if (target.chatId && current().chatId !== target.chatId) {
+                log('switch:open-chat');
+                await withTimeout(c.openCharacterChat(target.chatId), 15000, '打开聊天记录');
+            }
+            log('switch:done', { ms: Date.now() - switchingSince });
         } catch (error) {
+            logError('switch', error);
             notify(`切换失败：${shortError(error)}`);
         } finally {
             switching = false; syncCurrent(); render(); scheduleReattach(400);
@@ -574,16 +638,34 @@ export function start({ settings, save, installProfiles }) {
         }
         queueRender();
     }
-    async function copyJob(job) {
-        const { text, reasoning } = parsed(job);
-        const value = text || reasoning || bodyText(job);
-        try { await host.navigator.clipboard.writeText(value); notify('已复制回复文本。'); }
+    async function copyText(value, done) {
+        try { await host.navigator.clipboard.writeText(value); notify(done); }
         catch {
-            const area = element('textarea'); area.value = value; area.readOnly = true; area.style.cssText = 'width:100%;height:160px';
-            picker.replaceChildren(element('p', 'pt-muted', '浏览器不允许自动复制，请手动全选复制。'), area, button('返回', () => { pickerOpen = false; render(); }));
+            const area = element('textarea'); area.id = 'pt-diagnostic-text'; area.value = value; area.readOnly = true; area.style.cssText = 'width:calc(100% - 40px);height:180px';
+            picker.replaceChildren(element('p', 'pt-muted', '浏览器不允许自动复制，请长按下面的文字全选后复制。'), area, button('返回', () => { pickerOpen = false; render(); }));
             pickerOpen = true; panelOpen = true; render(); area.focus(); area.select();
         }
     }
+    function copyJob(job) {
+        const { text, reasoning } = parsed(job);
+        return copyText(text || reasoning || bodyText(job), '已复制回复文本。');
+    }
+    function diagnosticReport() {
+        let appVersion = null;
+        try { appVersion = doc.querySelector('#version_display, #version_display_welcome')?.textContent?.trim().slice(0, 80) || null; } catch { /* optional */ }
+        return {
+            plugin: VERSION, time: new Date().toISOString(), uptimeMs: Date.now() - startedAt,
+            userAgent: host.navigator.userAgent, tauri: !!(host.__TAURI__ || host.__TAURI_INTERNALS__), app: appVersion,
+            viewport: [host.innerWidth, host.innerHeight], visible: doc.visibilityState,
+            mainApi: (() => { try { return ctx().mainApi; } catch { return null; } })(),
+            group: !!current().group, current: sid(curKey),
+            state: { ...genState(), switching, switchingForMs: switching ? Date.now() - switchingSince : 0, reattachBusy, replayArmed: !!replayArm, fetchArmed: !!armed, fetchHooked: host.fetch === parallelFetch, launcherSide, panelOpen },
+            sessions: [...sessions.values()].map(s => ({ s: sid(s.key), here: s.key === curKey, unread: s.unread,
+                job: s.job ? { type: s.job.type, status: s.job.status, attached: s.job.attached, detaching: s.job.detaching, http: s.job.head?.status ?? null, bytes: s.job.bytes, created: s.job.created, mismatch: !!s.job.mismatch } : null })),
+            errors, log: logs.map(entry => entry.length > 2 ? `${entry[0]} ${entry[1]} ${JSON.stringify(entry[2])}` : `${entry[0]} ${entry[1]}`),
+        };
+    }
+    const exportDiagnostics = () => copyText(JSON.stringify(diagnosticReport(), null, 1), '诊断记录已复制，可以直接粘贴发送。');
 
     // ----- 提示音 -----
     const soundKey = 'parallel-tavern.completion-sound';
@@ -740,7 +822,8 @@ export function start({ settings, save, installProfiles }) {
         node.addEventListener('pointermove', e => {
             if (!drag || e.pointerId !== drag.id) return;
             const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
-            if (Math.abs(dx) + Math.abs(dy) < 5 && !drag.moved) return;
+            // 手指点按常带十来像素的抖动，阈值太小会把点按当成拖动而吞掉点击。
+            if (Math.abs(dx) + Math.abs(dy) < (e.pointerType === 'mouse' ? 5 : 14) && !drag.moved) return;
             drag.moved = true; e.preventDefault();
             node.dataset.ptDragged = 'true';
             const bounds = floatingBounds();
@@ -943,7 +1026,7 @@ export function start({ settings, save, installProfiles }) {
             sound.setAttribute('role', 'switch'); sound.setAttribute('aria-checked', String(soundEnabled));
             const tips = element('details');
             tips.append(element('summary', '', '使用说明'), element('p', 'pt-muted', '发出消息后，从这里切到别的对话，原来的回复会在后台继续接收；切回时自动写入聊天。最多 3 个会话同时生成。刷新或退出页面会中断还没收完的回复，已收完但没写回的会保留。群聊与扩展自己发起的请求不转入后台。'));
-            menu.append(theme, sound, tips); panel.insertBefore(menu, footer);
+            menu.append(theme, sound, button('复制诊断', () => void exportDiagnostics()), tips); panel.insertBefore(menu, footer);
         }
     }
     function refreshLive() {
@@ -1060,6 +1143,7 @@ export function start({ settings, save, installProfiles }) {
         setLauncherVisible(value) { launcherVisible = value !== false; render(); },
         setNightMode,
         dispose,
+        exportDiagnostics, diagnosticReport,
         diagnostics: () => ({ version: VERSION, current: curKey, readings: [...readings].map(([k, v]) => [k.slice(0, 24), v]), restoring: restoringUntil > Date.now(), generating: isGenerating(), armed: !!armed, replay: !!replayArm,
             sessions: [...sessions.values()].map(s => ({ name: s.name, chatId: s.chatId, unread: s.unread, job: s.job ? { type: s.job.type, status: s.job.status, attached: s.job.attached, bytes: s.job.bytes, created: s.job.created, mismatch: !!s.job.mismatch } : null })) }),
     };

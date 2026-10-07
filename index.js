@@ -5,12 +5,14 @@ import { start } from './runtime.js';
 
 const KEY = 'parallel_tavern';
 const CONTROLLER = '__PARALLEL_TAVERN_V2__';
-const VERSION = '0.6.1';
+const VERSION = '0.6.3';
+let startupError = '';
 
 void initialize().catch(error => {
     console.error('[并行对话]', error);
     const status = document.getElementById('pt-extension-status');
-    if (status) status.textContent = '启动失败，请查看控制台或刷新后重试。';
+    startupError = `启动失败：${String(error?.message || error).slice(0, 200)}`;
+    if (status) status.textContent = startupError;
 });
 
 async function initialize() {
@@ -42,7 +44,8 @@ async function initialize() {
                 <label class="checkbox_label" for="pt-extension-night"><input id="pt-extension-night" type="checkbox"><span>夜间模式</span></label>
                 <label class="checkbox_label" for="pt-extension-character-settings"><input id="pt-extension-character-settings" type="checkbox"><span>按角色记住预设与模型</span></label>
                 <small>同一角色的不同聊天共用选择；切到该角色时恢复，正在生成时不更换。不复制 API 密钥或预设文件。</small>
-                <div><button type="button" class="menu_button" id="pt-extension-open">打开并行面板</button></div>
+                <div class="flex-container"><button type="button" class="menu_button" id="pt-extension-open">打开并行面板</button><button type="button" class="menu_button" id="pt-extension-diagnostics">复制诊断</button></div>
+                <small>切换卡住或没反应时，先复现一次，再点“复制诊断”把内容发给作者。不含聊天内容、角色名和密钥。</small>
                 <small id="pt-extension-status" role="status"></small>
             </div>
         </div>`;
@@ -72,9 +75,15 @@ async function initialize() {
     window.addEventListener('pt-night-mode', () => { night.checked = readNight(); });
     root.querySelector('#pt-extension-open').addEventListener('click', () => {
         if (controller()) controller().show();
-        else status.textContent = '并行对话尚未启动，请刷新后重试。';
+        else status.textContent = startupError || '并行对话尚未启动，请刷新后重试。';
     });
 
+    root.querySelector('#pt-extension-diagnostics').addEventListener('click', async () => {
+        if (controller()?.exportDiagnostics) { await controller().exportDiagnostics(); return; }
+        const text = JSON.stringify({ plugin: VERSION, started: false, startupError, userAgent: navigator.userAgent, time: new Date().toISOString() }, null, 1);
+        try { await navigator.clipboard.writeText(text); status.textContent = '诊断记录已复制。'; }
+        catch { status.textContent = text; }
+    });
     if (window[CONTROLLER] && !window[CONTROLLER].version) {
         status.textContent = '检测到旧版并行脚本仍在运行。请停用旧脚本并刷新，新版才会接管。';
         return;
