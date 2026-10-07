@@ -1,0 +1,88 @@
+import { extension_settings } from '../../../extensions.js';
+import { saveSettingsDebounced } from '../../../../script.js';
+import { installCharacterProfiles } from './character-profiles.js';
+import { start } from './runtime.js';
+
+const KEY = 'parallel_tavern';
+const CONTROLLER = '__PARALLEL_TAVERN_V2__';
+const VERSION = '0.6.1';
+
+void initialize().catch(error => {
+    console.error('[并行对话]', error);
+    const status = document.getElementById('pt-extension-status');
+    if (status) status.textContent = '启动失败，请查看控制台或刷新后重试。';
+});
+
+async function initialize() {
+    if (document.getElementById('pt-extension-settings')) return;
+    // 0.5.x 的子页面（iframe）里不再启动任何东西。
+    try { if (window.frameElement?.dataset.ptSessionId || window.__PT_CHILD_ID__) return; } catch { /* cross-origin parent */ }
+    const settings = (extension_settings[KEY] ||= {});
+    if (typeof settings.showLauncher !== 'boolean') settings.showLauncher = true;
+    const persist = () => saveSettingsDebounced();
+
+    const root = document.createElement('div');
+    root.id = 'pt-extension-settings';
+    root.className = 'extension_container';
+    root.innerHTML = `
+        <div class="inline-drawer">
+            <div class="inline-drawer-toggle inline-drawer-header">
+                <b>并行对话 · ${VERSION}</b>
+                <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+            </div>
+            <div class="inline-drawer-content">
+                <label class="checkbox_label" for="pt-extension-show-launcher">
+                    <input id="pt-extension-show-launcher" type="checkbox">
+                    <span>显示悬浮窗</span>
+                </label>
+                <small>关闭后隐藏悬浮入口；后台回复仍会继续接收。</small>
+                <small>拖到左侧后向左滑、拖到右侧后向右滑，可缩成侧边小条。黄色表示正在生成，绿色表示有回复待查看。</small>
+                <label class="checkbox_label" for="pt-extension-avatar-switch"><input id="pt-extension-avatar-switch" type="checkbox"><span>点击悬浮头像切换对话</span></label>
+                <small>默认关闭。开启后点击头像直达对应对话，点击文字区域仍打开面板。</small>
+                <label class="checkbox_label" for="pt-extension-night"><input id="pt-extension-night" type="checkbox"><span>夜间模式</span></label>
+                <label class="checkbox_label" for="pt-extension-character-settings"><input id="pt-extension-character-settings" type="checkbox"><span>按角色记住预设与模型</span></label>
+                <small>同一角色的不同聊天共用选择；切到该角色时恢复，正在生成时不更换。不复制 API 密钥或预设文件。</small>
+                <div><button type="button" class="menu_button" id="pt-extension-open">打开并行面板</button></div>
+                <small id="pt-extension-status" role="status"></small>
+            </div>
+        </div>`;
+    const container = document.getElementById('extensions_settings2') || document.getElementById('extensions_settings');
+    if (!container) throw new Error('Extension settings container unavailable');
+    container.append(root);
+
+    const controller = () => window[CONTROLLER];
+    const launcher = root.querySelector('#pt-extension-show-launcher');
+    const avatarSwitch = root.querySelector('#pt-extension-avatar-switch');
+    const night = root.querySelector('#pt-extension-night');
+    const remember = root.querySelector('#pt-extension-character-settings');
+    const status = root.querySelector('#pt-extension-status');
+    const readNight = () => { try { return localStorage.getItem('parallel-tavern.night-mode') === 'on'; } catch { return false; } };
+    launcher.checked = settings.showLauncher;
+    avatarSwitch.checked = settings.avatarQuickSwitch === true;
+    remember.checked = settings.rememberCharacterSettings !== false;
+    night.checked = readNight();
+    launcher.addEventListener('change', () => {
+        settings.showLauncher = launcher.checked; persist();
+        controller()?.setLauncherVisible(settings.showLauncher);
+        status.textContent = settings.showLauncher ? '悬浮窗已显示。' : '悬浮窗已隐藏，可从这里重新打开面板。';
+    });
+    avatarSwitch.addEventListener('change', () => { settings.avatarQuickSwitch = avatarSwitch.checked; persist(); });
+    remember.addEventListener('change', () => { settings.rememberCharacterSettings = remember.checked; persist(); });
+    night.addEventListener('change', () => controller()?.setNightMode(night.checked));
+    window.addEventListener('pt-night-mode', () => { night.checked = readNight(); });
+    root.querySelector('#pt-extension-open').addEventListener('click', () => {
+        if (controller()) controller().show();
+        else status.textContent = '并行对话尚未启动，请刷新后重试。';
+    });
+
+    if (window[CONTROLLER] && !window[CONTROLLER].version) {
+        status.textContent = '检测到旧版并行脚本仍在运行。请停用旧脚本并刷新，新版才会接管。';
+        return;
+    }
+    start({
+        settings,
+        save: saveSettingsDebounced,
+        installProfiles: (win, options) => installCharacterProfiles(win, { ...options, settings, save: saveSettingsDebounced }),
+    });
+    controller()?.setLauncherVisible(settings.showLauncher);
+}
