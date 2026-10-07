@@ -1,11 +1,12 @@
 import { extension_settings } from '../../../extensions.js';
 import { saveSettingsDebounced } from '../../../../script.js';
+import * as core from '../../../../script.js';
 import { installCharacterProfiles } from './character-profiles.js';
 import { start } from './runtime.js';
 
 const KEY = 'parallel_tavern';
 const CONTROLLER = '__PARALLEL_TAVERN_V2__';
-const VERSION = '0.6.3';
+const VERSION = '0.6.4';
 let startupError = '';
 
 void initialize().catch(error => {
@@ -91,6 +92,8 @@ async function initialize() {
     start({
         settings,
         save: saveSettingsDebounced,
+        // 实时读取酒馆的“正在生成”标志（模块导出是活绑定）。旧宿主没有导出时返回 undefined，运行时会退回看界面。
+        nativeBusy: () => core.is_send_press,
         installProfiles: (win, options) => installCharacterProfiles(win, { ...options, settings, save: saveSettingsDebounced }),
     });
     controller()?.setLauncherVisible(settings.showLauncher);
