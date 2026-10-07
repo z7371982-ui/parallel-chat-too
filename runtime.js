@@ -1,11 +1,11 @@
-/* 并行对话 0.6.4 — 单页面后台生成。
+/* 并行对话 0.6.5 — 单页面后台生成。
  *
  * 不再为每个会话启动第二个酒馆页面（iframe）。切换对话时，只把正在进行的
  * 生成请求留在后台继续接收；切回该对话后，由酒馆原生流程把保存下来的响应
  * 重新走一遍（正则、变量脚本、保存都是原生逻辑）。不自行拼接提示词，不直接
  * 写聊天文件，不保存 API 密钥。
  */
-const VERSION = '0.6.4';
+const VERSION = '0.6.5';
 const KEY = '__PARALLEL_TAVERN_V2__';
 const MAX_SESSIONS = 3;
 const STORE = 'parallel-tavern.jobs.v1';
@@ -106,6 +106,8 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
     let fullLoggedFor = null;
     let building = null;          // 原生生成已开始、请求尚未发出
     let lastGenStart = 0, dryActiveUntil = 0, sendIntentAt = 0;
+    let fgFinishedKey = null, lastStoppedAt = 0;   // 前台生成刚结束（侧边小条显示绿色用）
+    const drafts = new Map();                       // 每个会话各自的未发送草稿
 
     // ----- 诊断记录：只记步骤、状态和报错位置，不记聊天内容、角色名或密钥 -----
     const startedAt = Date.now();
@@ -461,22 +463,38 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
         if (type === 'quiet') { quietPending++; return; }
         quietPending = 0;
         const info = current(), chat = ctx().chat, last = chat[chat.length - 1];
-        gen = { type, info, cont: type === 'continue' && last ? { mes: String(last.mes ?? '') } : null };
+        gen = { type, info, replay: !!replayArm, cont: type === 'continue' && last ? { mes: String(last.mes ?? '') } : null };
+        fgFinishedKey = null;
         building = info.key && TYPES.includes(type) ? { key: info.key, type, since: Date.now() } : null;
         log('gen:start', { type, s: sid(info.key) });
+        // 很旧的宿主没有“提示词已就绪”事件：只能从生成开始就等下一条生成请求。
+        if (!events.GENERATE_AFTER_DATA) armNext(90000);
         queueRender();
     });
     on(events.GENERATE_AFTER_DATA, (_data, dryRun) => {
         if (dryRun) { dryActiveUntil = 0; return; }
         if (quietPending > 0) { quietPending--; return; }
         if (!gen) return;
-        if (replayArm && replayArm.job.key === gen.info.key) armed = { replay: replayArm.job, until: Date.now() + 15000 };
-        else if (gen.info.key && TYPES.includes(gen.type)) armed = { gen, until: Date.now() + 15000 };
+        armNext(8000);
     });
+    function armNext(ms) {
+        if (!gen) return;
+        if (replayArm && replayArm.job.key === gen.info.key) armed = { replay: replayArm.job, until: Date.now() + ms };
+        else if (gen.info.key && TYPES.includes(gen.type)) armed = { gen, until: Date.now() + ms };
+    }
     const generationOver = () => { host.setTimeout(() => { settle(); queueRender(); }, 150); };
-    on(events.GENERATION_ENDED, () => { building = null; log('gen:ended'); generationOver(); });
-    on(events.GENERATION_STOPPED, () => { building = null; log('gen:stopped'); generationOver(); });
-    on(events.CHAT_CHANGED, () => { syncCurrent(); log('chat:changed', { s: sid(curKey) }); restoreReading(curKey); queueRender(); scheduleReattach(400); });
+    on(events.GENERATION_ENDED, () => {
+        building = null; log('gen:ended'); generationOver();
+        const finished = gen;
+        if (!finished || finished.ended) return;
+        finished.ended = true;
+        host.setTimeout(() => {
+            if (disposed || finished !== gen || finished.replay || Date.now() - lastStoppedAt < 1500 || isGenerating()) return;
+            if (finished.info.key && finished.info.key === curKey) { fgFinishedKey = curKey; queueRender(); }
+        }, 300);
+    });
+    on(events.GENERATION_STOPPED, () => { building = null; lastStoppedAt = Date.now(); fgFinishedKey = null; log('gen:stopped'); generationOver(); });
+    on(events.CHAT_CHANGED, () => { fgFinishedKey = null; syncCurrent(); log('chat:changed', { s: sid(curKey) }); restoreReading(curKey); queueRender(); scheduleReattach(400); });
     // 酒馆对 APP_READY 的“晚到订阅者”会在 on() 里立刻同步回调；扩展加载得比酒馆就绪晚时，
     // 那一刻本函数后面的变量还没初始化，所以这里一律推迟到下一个任务再处理。
     on(events.APP_READY, () => host.setTimeout(() => { if (disposed) return; syncCurrent(); queueRender(); scheduleReattach(600); }, 0));
@@ -484,10 +502,6 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
     // ----- 转入后台 / 切回 -----
     async function detach(job) {
         if (!job.attached || job.detaching) return false;
-        if ([...sessions.values()].filter(s => s.job && s.job !== job).length >= MAX_SESSIONS - 1) {
-            notify(`后台最多同时保留 ${MAX_SESSIONS - 1} 个回复。请先切回查看或丢弃其中一个。`);
-            return false;
-        }
         job.detaching = true;
         log('detach:start', { s: sid(job.key), type: job.type, bytes: job.bytes });
         let ended = false;
@@ -537,8 +551,9 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
             if (last?.extra?.pt_job && !jobs.has(last.extra.pt_job)) delete last.extra.pt_job;
             return;
         }
-        if (job.attached || job.detaching || job.mismatch || replayArm) return;
-        if (isGenerating() || isSwiping()) { scheduleReattach(800); return; }
+        if (job.mismatch) { if (session.unread) { session.unread = false; queueRender(); } return; }
+        if (job.attached || job.detaching || replayArm) return;
+        if (isGenerating() || isSwiping() || Date.now() - sendIntentAt < 1500) { scheduleReattach(800); return; }
         // 聊天刚加载完酒馆会做一两次“试算提示词”，避开它正在进行的时刻。
         if (Date.now() < dryActiveUntil) { scheduleReattach(250); return; }
         reattachBusy = true;
@@ -563,9 +578,16 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
                     if (Array.isArray(last.swipes) && last.swipes.length) last.swipes[Number(last.swipe_id) || 0] = job.cont.mes;
                     delete last.extra.pt_job; mode = 'continue';
                 }
-            } else if (job.created) {
-                if (marked && chat.length === job.baseLength + 1) mode = 'regenerate';
-            } else if (chat.length === job.baseLength) mode = last?.is_user ? 'regenerate' : 'normal';
+            } else if (marked && chat.length === job.baseLength + 1) {
+                // 半截回复由这里直接删掉：酒馆“重新生成”自带的删除有渐隐动画，页面不渲染时
+                // （切到后台、窗口被遮住）动画不走完，生成会一直卡在那一步。
+                if (typeof c.deleteLastMessage === 'function') {
+                    await c.deleteLastMessage();
+                    job.created = false;
+                    const now = ctx().chat;
+                    if (now.length === job.baseLength) mode = now[now.length - 1]?.is_user ? 'regenerate' : 'normal';
+                } else mode = 'regenerate';
+            } else if (chat.length === job.baseLength && !last?.extra?.pt_job) mode = last?.is_user ? 'regenerate' : 'normal';
             log('reattach', { s: sid(job.key), type: job.type, mode, created: job.created, marked, len: chat.length, base: job.baseLength, status: job.status });
             if (!mode) {
                 job.mismatch = true; session.unread = true;
@@ -668,14 +690,32 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
             const index = c.characters.findIndex(character => character?.avatar === target.avatar);
             if (index < 0) { log('switch:no-character'); notify('没有找到这个角色，请先刷新角色列表。'); return; }
             panelOpen = false; pickerOpen = false; render();
+            const originKey = curKey, input = doc.getElementById('send_textarea');
+            const originDraft = input ? String(input.value || '') : '';
+            const select = () => withTimeout(ctx().selectCharacterById(index, { switchMenu: false }), 15000, '打开角色');
             if (c.groupId || String(c.characterId) !== String(index)) {
                 log('switch:select');
-                await withTimeout(c.selectCharacterById(index, { switchMenu: false }), 15000, '打开角色');
+                await select();
+                if (current().avatar !== target.avatar && !isGenerating()) {
+                    // 酒馆正在保存聊天时会拒绝切换，稍等再试一次。
+                    log('switch:retry', genState());
+                    await delay(900);
+                    await select();
+                }
             }
             if (current().avatar !== target.avatar) { log('switch:not-switched', genState()); notify('酒馆没有完成切换（可能还在保存或生成），请稍后再试。'); return; }
             if (target.chatId && current().chatId !== target.chatId) {
                 log('switch:open-chat');
                 await withTimeout(c.openCharacterChat(target.chatId), 15000, '打开聊天记录');
+            }
+            // 草稿跟着会话走：离开时收起这边没发出的文字，回来时再放回输入框。
+            const arrived = current().key;
+            if (input && arrived && arrived !== originKey) {
+                if (originKey) { if (originDraft) drafts.set(originKey, originDraft); else drafts.delete(originKey); }
+                const next = drafts.get(arrived) || '';
+                drafts.delete(arrived);
+                if (input.value !== next) { input.value = next; input.dispatchEvent(new host.Event('input', { bubbles: true })); }
+                if (drafts.size > 20) drafts.delete(drafts.keys().next().value);
             }
             log('switch:done', { ms: Date.now() - switchingSince });
         } catch (error) {
@@ -688,9 +728,9 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
     function closeSession(session) {
         if (session.job) {
             if (session.job.attached && isGenerating()) { notify('这个对话正在前台生成，请先停止或等待完成。'); return; }
-            if (!host.confirm(session.job.status === 'running' ? '这个对话还在后台生成，关闭会丢弃这次回复。确定关闭？' : '这个对话有一条还没写回的后台回复，关闭会丢弃它。确定关闭？')) return;
             drop(session.job, { abort: true });
         }
+        drafts.delete(session.key);
         if (session.key !== curKey) { sessions.delete(session.key); log('session:close', { s: sid(session.key) }); }
         // 腾出位置后，当前对话若还不是会话就补进来。
         syncCurrent();
@@ -728,7 +768,7 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
             viewport: [host.innerWidth, host.innerHeight], visible: doc.visibilityState,
             mainApi: (() => { try { return ctx().mainApi; } catch { return null; } })(),
             group: !!current().group, current: sid(curKey),
-            state: { ...genState(), switching, switchingForMs: switching ? Date.now() - switchingSince : 0, reattachBusy, replayArmed: !!replayArm, fetchArmed: !!armed, fetchHooked: host.fetch === parallelFetch, launcherSide, panelOpen },
+            state: { ...genState(), switching, switchingForMs: switching ? Date.now() - switchingSince : 0, reattachBusy, replayArmed: !!replayArm, fetchArmed: !!armed, fetchHooked: host.fetch === parallelFetch, hasPromptEvent: !!events.GENERATE_AFTER_DATA, launcherSide, panelOpen, drafts: drafts.size },
             sessions: [...sessions.values()].map(s => ({ s: sid(s.key), here: s.key === curKey, unread: s.unread,
                 job: s.job ? { type: s.job.type, status: s.job.status, attached: s.job.attached, detaching: s.job.detaching, http: s.job.head?.status ?? null, bytes: s.job.bytes, created: s.job.created, mismatch: !!s.job.mismatch } : null })),
             errors, log: logs.map(entry => entry.length > 2 ? `${entry[0]} ${entry[1]} ${JSON.stringify(entry[2])}` : `${entry[0]} ${entry[1]}`),
@@ -798,13 +838,24 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
         const path = doc.createElementNS('http://www.w3.org/2000/svg', 'path'); path.setAttribute('d', paths[name] || paths.more);
         svg.append(path); node.append(svg); return node;
     }
-    function portrait(item) {
+    const portraitCache = new Map();
+    function stablePortrait(slot, item) {
+        const id = slot + '|' + item.avatar + '|' + item.name;
+        let face = portraitCache.get(id);
+        if (!face) {
+            face = portrait(item, false);
+            portraitCache.set(id, face);
+            if (portraitCache.size > 60) portraitCache.delete(portraitCache.keys().next().value);
+        }
+        return face;
+    }
+    function portrait(item, lazy = true) {
         const face = element('span', 'pt-portrait', [...(item.name || '聊')][0]);
         face.setAttribute('aria-hidden', 'true');
         try {
             const url = item.avatar && ctx().getThumbnailUrl?.('avatar', item.avatar);
             if (url) {
-                const img = doc.createElement('img'); img.alt = ''; img.loading = 'lazy'; img.decoding = 'async'; img.src = url;
+                const img = doc.createElement('img'); img.alt = ''; if (lazy) { img.loading = 'lazy'; img.decoding = 'async'; } img.src = url;
                 img.addEventListener('error', () => img.remove(), { once: true }); face.append(img);
             }
         } catch { /* 缩略图不可用时保留首字 */ }
@@ -984,10 +1035,26 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
         host.setTimeout(() => { renderPending = false; if (!disposed) { if (pointerActive) queueRender(); else render(); } }, 160);
     }
 
+    // 两步确认：第一次点击变成确认文字，4 秒内再点才执行。不依赖 window.confirm。
+    let confirmId = null, confirmTimer = null;
+    function confirmButton(label, sureLabel, id, action) {
+        const sure = confirmId === id;
+        const node = button(sure ? sureLabel : label, () => {
+            host.clearTimeout(confirmTimer);
+            if (confirmId === id) { confirmId = null; action(); render(); return; }
+            confirmId = id; confirmTimer = host.setTimeout(() => { confirmId = null; queueRender(); }, 4000);
+            render();
+        }, label);
+        if (sure) node.classList.add('pt-danger');
+        return node;
+    }
     function stateOf(session) {
         const job = session.job, here = session.key === curKey;
         if (job && !job.attached) {
-            if (job.status === 'running') return { state: 'busy', busy: true, label: `后台生成中 · 已收到 ${parsed(job).text.length} 字` };
+            if (job.status === 'running') {
+                const got = parsed(job);
+                return { state: 'busy', busy: true, label: got.text ? `后台生成中 · 已收到 ${got.text.length} 字` : got.reasoning ? `后台生成中 · 正在思考（${got.reasoning.length} 字）` : '后台生成中 · 等待首个字' };
+            }
             if (job.mismatch) return { state: 'error', label: '聊天已变化，未自动写入' };
             if (job.failure || job.head?.status >= 400) return { state: 'error', label: '生成失败 · 切回查看原因' };
             return { state: 'done', label: here ? '正在写回…' : job.truncated ? '已中断 · 切回写入已收到的部分' : '已完成 · 点击切回查看' };
@@ -1013,12 +1080,13 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
         const states = all.map(stateOf);
         const running = states.filter(s => s.busy).length;
         const completed = all.filter(s => s.unread);
-        launcher.dataset.state = running ? 'generating' : completed.length ? 'completed' : 'idle';
+        const finished = completed.length > 0 || (!!fgFinishedKey && fgFinishedKey === curKey);
+        launcher.dataset.state = running ? 'generating' : finished ? 'completed' : 'idle';
         const sig = JSON.stringify([running, completed.length, all.map(s => [s.key, s.name])]);
         if (sig !== launcherSignature) {
             launcherSignature = sig;
             const dock = element('span', 'pt-dock'), faces = element('span', 'pt-dock-faces');
-            for (const s of all) { const face = portrait(s); face.dataset.ptSession = s.key; faces.append(face); }
+            for (const s of all) { const face = stablePortrait('dock:' + s.key, s); face.dataset.ptSession = s.key; faces.append(face); }
             if (!all.length) faces.append(portrait({ name: '并' }));
             const label = element('span', 'pt-dock-label', completed.length ? `${completed.length} 个已完成` : '并行会话');
             label.append(element('span', 'pt-dock-note', running ? `${running} 个正在回复` : '点开查看会话'));
@@ -1031,7 +1099,7 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
             completionBadge.replaceChildren(...completed.map(s => { const badge = element('span', 'pt-avatar-badge', '1'); badge.dataset.ptSession = s.key; return badge; }));
         }
         show(completionBadge, completed.length > 0 && !launcherSide); positionCompletionBadge();
-        const label = launcherSide ? `并行对话：${running ? `${running} 个会话正在生成` : completed.length ? '生成已完成' : '暂无生成'}；点击或向内滑动展开`
+        const label = launcherSide ? `并行对话：${running ? `${running} 个会话正在生成` : finished ? '生成已完成' : '暂无生成'}；点击或向内滑动展开`
             : completed.length ? `并行对话：${completed.map(s => s.name).join('、')} 已生成完成，待查看` : '并行对话；拖到边缘后向外滑动可收起';
         launcher.title = label; launcher.setAttribute('aria-label', label);
     }
@@ -1079,15 +1147,15 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
             if (here) title.append(element('span', 'pt-current', '当前'));
             else if (session.unread) title.append(element('span', 'pt-completed', '新回复'));
             copy.append(title, element('span', 'pt-chat-name', session.chatId), element('span', 'pt-preview', preview(session).replace(/\s+/g, ' ') || '点击进入对话'), element('span', 'pt-status', status.label));
-            open.append(portrait(session), copy); sessionRow.append(open);
+            open.append(stablePortrait('card:' + session.key, session), copy); sessionRow.append(open);
             const more = iconButton('会话操作', 'more', () => { controlsKey = controlsKey === session.key ? null : session.key; render(); });
             more.setAttribute('aria-expanded', String(controlsKey === session.key)); sessionRow.append(more); card.append(sessionRow);
             if (controlsKey === session.key) {
                 const controls = element('div', 'pt-actions');
                 if (status.busy) controls.append(button('停止生成', () => stopSession(session)));
                 if (job && !job.attached && job.status !== 'running' && job.head) controls.append(button('复制回复', () => void copyJob(job)));
-                if (job && !job.attached) { const discard = button('丢弃回复', () => { if (host.confirm('丢弃这条后台回复？聊天里已保存的内容不会改变。')) drop(job, { abort: true }); }); discard.classList.add('pt-danger'); controls.append(discard); }
-                if (!here) controls.append(button('关闭会话', () => closeSession(session)));
+                if (job && !job.attached) { const discard = confirmButton('丢弃回复', '再点一次确认丢弃', 'discard:' + session.key, () => drop(job, { abort: true })); discard.classList.add('pt-danger'); controls.append(discard); }
+                if (!here) controls.append(job ? confirmButton('关闭会话', job.status === 'running' ? '后台回复会被丢弃，再点确认' : '未写回的回复会被丢弃，再点确认', 'close:' + session.key, () => closeSession(session)) : button('关闭会话', () => closeSession(session)));
                 if (!controls.childElementCount) controls.append(element('span', 'pt-muted', '这是当前对话'));
                 card.append(controls);
             }
@@ -1235,6 +1303,7 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
         setNightMode,
         dispose,
         exportDiagnostics, diagnosticReport,
+        getActiveWindow: () => host,
         diagnostics: () => ({ version: VERSION, current: curKey, readings: [...readings].map(([k, v]) => [k.slice(0, 24), v]), restoring: restoringUntil > Date.now(), generating: isGenerating(), armed: !!armed, replay: !!replayArm,
             sessions: [...sessions.values()].map(s => ({ name: s.name, chatId: s.chatId, unread: s.unread, job: s.job ? { type: s.job.type, status: s.job.status, attached: s.job.attached, bytes: s.job.bytes, created: s.job.created, mismatch: !!s.job.mismatch } : null })) }),
     };

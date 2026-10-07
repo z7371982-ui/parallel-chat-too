@@ -6,7 +6,7 @@ import { start } from './runtime.js';
 
 const KEY = 'parallel_tavern';
 const CONTROLLER = '__PARALLEL_TAVERN_V2__';
-const VERSION = '0.6.4';
+const VERSION = '0.6.5';
 let startupError = '';
 
 void initialize().catch(error => {
