@@ -6,7 +6,7 @@ import { start } from './runtime.js';
 
 const KEY = 'parallel_tavern';
 const CONTROLLER = '__PARALLEL_TAVERN_V2__';
-const VERSION = '0.6.5';
+const VERSION = '0.6.8';
 let startupError = '';
 
 void initialize().catch(error => {
@@ -34,6 +34,11 @@ async function initialize() {
                 <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
             </div>
             <div class="inline-drawer-content">
+                <label class="checkbox_label" for="pt-extension-enabled">
+                    <input id="pt-extension-enabled" type="checkbox">
+                    <span>开启角色并行</span>
+                </label>
+                <small>关闭时就是普通聊天，本扩展不接管任何生成。也可以在悬浮面板里开启或退出。</small>
                 <label class="checkbox_label" for="pt-extension-show-launcher">
                     <input id="pt-extension-show-launcher" type="checkbox">
                     <span>显示悬浮窗</span>
@@ -44,7 +49,7 @@ async function initialize() {
                 <small>默认关闭。开启后点击头像直达对应对话，点击文字区域仍打开面板。</small>
                 <label class="checkbox_label" for="pt-extension-night"><input id="pt-extension-night" type="checkbox"><span>夜间模式</span></label>
                 <label class="checkbox_label" for="pt-extension-character-settings"><input id="pt-extension-character-settings" type="checkbox"><span>按角色记住预设与模型</span></label>
-                <small>同一角色的不同聊天共用选择；切到该角色时恢复，正在生成时不更换。不复制 API 密钥或预设文件。</small>
+                <small>记住每个角色最后一次用的预设、接口类型和模型，下次切到这个角色时恢复。在角色里随时可以改，改了就以新的为准，不会被改回去。同一角色的不同聊天共用。不复制 API 密钥或预设文件。</small>
                 <div class="flex-container"><button type="button" class="menu_button" id="pt-extension-open">打开并行面板</button><button type="button" class="menu_button" id="pt-extension-diagnostics">复制诊断</button></div>
                 <small>切换卡住或没反应时，先复现一次，再点“复制诊断”把内容发给作者。不含聊天内容、角色名和密钥。</small>
                 <small id="pt-extension-status" role="status"></small>
@@ -71,6 +76,13 @@ async function initialize() {
         status.textContent = settings.showLauncher ? '悬浮窗已显示。' : '悬浮窗已隐藏，可从这里重新打开面板。';
     });
     avatarSwitch.addEventListener('change', () => { settings.avatarQuickSwitch = avatarSwitch.checked; persist(); });
+    const enabledBox = root.querySelector('#pt-extension-enabled');
+    enabledBox.checked = settings.parallelEnabled === true;
+    enabledBox.addEventListener('change', () => {
+        const ok = controller()?.setEnabled?.(enabledBox.checked);
+        if (ok === false || !controller()) enabledBox.checked = settings.parallelEnabled === true;
+    });
+    window.addEventListener('pt-parallel-enabled', () => { enabledBox.checked = settings.parallelEnabled === true; });
     remember.addEventListener('change', () => { settings.rememberCharacterSettings = remember.checked; persist(); });
     night.addEventListener('change', () => controller()?.setNightMode(night.checked));
     window.addEventListener('pt-night-mode', () => { night.checked = readNight(); });

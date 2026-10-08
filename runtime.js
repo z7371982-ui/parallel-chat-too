@@ -1,11 +1,11 @@
-/* 并行对话 0.6.5 — 单页面后台生成。
+/* 并行对话 0.6.8 — 单页面后台生成。
  *
  * 不再为每个会话启动第二个酒馆页面（iframe）。切换对话时，只把正在进行的
  * 生成请求留在后台继续接收；切回该对话后，由酒馆原生流程把保存下来的响应
  * 重新走一遍（正则、变量脚本、保存都是原生逻辑）。不自行拼接提示词，不直接
  * 写聊天文件，不保存 API 密钥。
  */
-const VERSION = '0.6.5';
+const VERSION = '0.6.8';
 const KEY = '__PARALLEL_TAVERN_V2__';
 const MAX_SESSIONS = 3;
 const STORE = 'parallel-tavern.jobs.v1';
@@ -102,6 +102,8 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
     let replayArm = null;         // 切回后等待原生流程发起的那次请求
     let switching = false, reattachBusy = false, reattachTimer = null;
     let profile = null;
+    // 并行开关：关闭时本扩展不接管任何请求、不建会话、不动草稿和滚动，就是普通聊天。
+    const isOn = () => settings.parallelEnabled === true;
     let switchingSince = 0;
     let fullLoggedFor = null;
     let building = null;          // 原生生成已开始、请求尚未发出
@@ -193,7 +195,7 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
         const info = current();
         curKey = info.key;
         // 切换途中酒馆可能先短暂打开该角色的另一份聊天，那不是用户要的会话，不建卡。
-        if (info.key && !switching) ensureSession(info);
+        if (info.key && !switching && isOn()) ensureSession(info);
     }
 
     // ----- 后台任务 -----
@@ -478,6 +480,7 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
         armNext(8000);
     });
     function armNext(ms) {
+        if (!isOn()) return;
         if (!gen) return;
         if (replayArm && replayArm.job.key === gen.info.key) armed = { replay: replayArm.job, until: Date.now() + ms };
         else if (gen.info.key && TYPES.includes(gen.type)) armed = { gen, until: Date.now() + ms };
@@ -494,7 +497,7 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
         }, 300);
     });
     on(events.GENERATION_STOPPED, () => { building = null; lastStoppedAt = Date.now(); fgFinishedKey = null; log('gen:stopped'); generationOver(); });
-    on(events.CHAT_CHANGED, () => { fgFinishedKey = null; syncCurrent(); log('chat:changed', { s: sid(curKey) }); restoreReading(curKey); queueRender(); scheduleReattach(400); });
+    on(events.CHAT_CHANGED, () => { fgFinishedKey = null; gen = null; armed = null; building = null; syncCurrent(); log('chat:changed', { s: sid(curKey) }); if (isOn()) restoreReading(curKey); queueRender(); scheduleReattach(400); });
     // 酒馆对 APP_READY 的“晚到订阅者”会在 on() 里立刻同步回调；扩展加载得比酒馆就绪晚时，
     // 那一刻本函数后面的变量还没初始化，所以这里一律推迟到下一个任务再处理。
     on(events.APP_READY, () => host.setTimeout(() => { if (disposed) return; syncCurrent(); queueRender(); scheduleReattach(600); }, 0));
@@ -509,7 +512,7 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
         emitter.on(events.GENERATION_ENDED, onEnded);
         try {
             ctx().stopGeneration();
-            await waitFor(() => ended, 1200);
+            await waitFor(() => ended || (pressFlag() === false && !domGenerating()), 1200);
             const idle = await waitFor(() => !isGenerating() && !isSwiping(), 8000);
             if (!idle) log('detach:still-busy', genState());
             if (job.type === 'swipe') { await delay(150); await waitFor(() => !isSwiping(), 5000); }
@@ -540,6 +543,30 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
         host.clearTimeout(reattachTimer);
         reattachTimer = host.setTimeout(() => void tryReattach(), ms);
     }
+    function setEnabled(value) {
+        value = value === true;
+        if (value === isOn()) return true;
+        if (value) {
+            settings.parallelEnabled = true; save();
+            log('parallel:on');
+            restore(); syncCurrent();
+            notify('已开启并行。发出消息后可以切到别的角色，回复会在后台继续。');
+        } else {
+            const pending = [...sessions.values()].filter(session => session.job);
+            if (pending.length || foregroundJob()) {
+                panelOpen = true; pickerOpen = false; render();
+                notify(`还有 ${pending.length || 1} 个会话的回复在生成或还没写回。请等它们完成并切回查看，或在面板里丢弃后再退出。`);
+                return false;
+            }
+            settings.parallelEnabled = false; save();
+            log('parallel:off');
+            sessions.clear(); drafts.clear(); readings.clear(); armed = null;
+            notify('已退出并行，现在是普通聊天。');
+        }
+        host.dispatchEvent(new host.CustomEvent('pt-parallel-enabled', { detail: isOn() }));
+        render();
+        return true;
+    }
     async function tryReattach() {
         if (disposed || reattachBusy || switching) return;
         const info = current();
@@ -551,9 +578,10 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
             if (last?.extra?.pt_job && !jobs.has(last.extra.pt_job)) delete last.extra.pt_job;
             return;
         }
-        if (job.mismatch) { if (session.unread) { session.unread = false; queueRender(); } return; }
+        if (job.mismatch) return;
         if (job.attached || job.detaching || replayArm) return;
         if (isGenerating() || isSwiping() || Date.now() - sendIntentAt < 1500) { scheduleReattach(800); return; }
+        if (doc.getElementById('curEditTextarea')?.offsetParent) { scheduleReattach(1500); return; }
         // 聊天刚加载完酒馆会做一两次“试算提示词”，避开它正在进行的时刻。
         if (Date.now() < dryActiveUntil) { scheduleReattach(250); return; }
         reattachBusy = true;
@@ -591,7 +619,7 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
             log('reattach', { s: sid(job.key), type: job.type, mode, created: job.created, marked, len: chat.length, base: job.baseLength, status: job.status });
             if (!mode) {
                 job.mismatch = true; session.unread = true;
-                notify(`「${job.name}」的聊天内容已有变化，后台回复没有自动写入。可在并行面板里复制文本或丢弃。`);
+                notify(`「${job.name}」的聊天内容已有变化，后台回复没有自动写入。可在并行面板里点“…”直接写入原消息、复制或丢弃。`);
                 render(); return;
             }
             session.unread = false;
@@ -621,7 +649,7 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
         job.retries = (job.retries || 0) + 1;
         if (job.retries >= 2 || job.type === 'swipe' || job.type === 'continue') {
             job.mismatch = true; session.unread = true;
-            notify(`「${job.name}」的后台回复没能自动写入，可在并行面板里复制文本，或丢弃后重新生成。`);
+            notify(`「${job.name}」的后台回复没能自动写入。可在并行面板里点“…”直接写入原消息、复制或丢弃。`);
         } else scheduleReattach(1500);
         render();
     }
@@ -683,7 +711,7 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
             }
             if (isGenerating()) {
                 const job = foregroundJob();
-                if (!job) { log('switch:blocked-untracked', genState()); notify(curKey && !sessions.has(curKey) ? `当前对话不在 ${MAX_SESSIONS} 个并行会话里，这次生成不能转入后台。请等待完成或先停止。` : '当前这次生成无法转入后台（群聊、扩展自己的请求或不支持的接口）。请等待完成或先停止。'); return; }
+                if (!job) { log('switch:blocked-untracked', genState()); notify(sessions.get(curKey)?.job ? '这个对话还有一条没处理的后台回复（在面板里复制或丢弃它），所以这次新的生成不能转入后台。请等待完成或先停止。' : curKey && !sessions.has(curKey) ? `当前对话不在 ${MAX_SESSIONS} 个并行会话里，这次生成不能转入后台。请等待完成或先停止。` : '当前这次生成无法转入后台（群聊、扩展自己的请求或不支持的接口）。请等待完成或先停止。'); return; }
                 if (!(await detach(job))) { log('switch:detach-refused'); return; }
             }
             const c = ctx();
@@ -705,6 +733,11 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
             }
             if (current().avatar !== target.avatar) { log('switch:not-switched', genState()); notify('酒馆没有完成切换（可能还在保存或生成），请稍后再试。'); return; }
             if (target.chatId && current().chatId !== target.chatId) {
+                if (!(await chatExists(character, target.chatId))) {
+                    log('switch:chat-missing');
+                    notify('这份聊天记录已经不在该角色的历史里了（可能被改名或删除），没有打开，也没有新建。可在面板里关闭这个会话。');
+                    return;
+                }
                 log('switch:open-chat');
                 await withTimeout(c.openCharacterChat(target.chatId), 15000, '打开聊天记录');
             }
@@ -725,6 +758,17 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
             switching = false; syncCurrent(); render(); scheduleReattach(400);
         }
     }
+    async function chatExists(character, chatId) {
+        try {
+            const response = await withTimeout(host.fetch('/api/characters/chats', {
+                method: 'POST', headers: ctx().getRequestHeaders(), body: JSON.stringify({ avatar_url: character.avatar, ch_name: character.name }),
+            }), 10000, '读取聊天列表');
+            if (!response.ok) return false;
+            const data = await response.json();
+            if (!data || data.error) return false;
+            return Object.values(data).some(item => item && typeof item.file_name === 'string' && item.file_name.replace(/\.jsonl$/i, '') === chatId);
+        } catch (error) { logError('chat-list', error); return false; }
+    }
     function closeSession(session) {
         if (session.job) {
             if (session.job.attached && isGenerating()) { notify('这个对话正在前台生成，请先停止或等待完成。'); return; }
@@ -735,6 +779,38 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
         // 腾出位置后，当前对话若还不是会话就补进来。
         syncCurrent();
         controlsKey = null; render();
+    }
+    // 自动写回做不了时的补救：把完整文本直接填进当初那条半截回复（不经过酒馆的生成流程）。
+    function markedIndex(job) {
+        try { const chat = ctx().chat; for (let i = chat.length - 1; i >= 0; i--) if (chat[i]?.extra?.pt_job === job.id) return i; } catch { /* not ready */ }
+        return -1;
+    }
+    async function writeDirect(job) {
+        try {
+            if (current().key !== job.key) { notify('请先切到这份聊天再写入。'); return; }
+            if (isGenerating()) { notify('酒馆正在生成，请等它结束再写入。'); return; }
+            const c = ctx(), index = markedIndex(job), got = parsed(job), text = String(got.text || '').trim();
+            if (index < 0 || !text) { notify('没有找到可写入的位置或文本，可以改用“复制回复”。'); return; }
+            const message = c.chat[index];
+            const full = job.type === 'continue' && job.cont ? job.cont.mes + got.text : text;
+            if (job.type === 'swipe' && Array.isArray(message.swipes)) {
+                const slot = message.swipes.length > job.swipeIndex ? job.swipeIndex : message.swipes.push(full) - 1;
+                message.swipes[slot] = full;
+                if (Number(message.swipe_id) === slot) message.mes = full;
+            } else {
+                message.mes = full;
+                if (Array.isArray(message.swipes) && message.swipes.length) message.swipes[Number(message.swipe_id) || 0] = full;
+            }
+            message.extra ||= {};
+            if (got.reasoning && !message.extra.reasoning) message.extra.reasoning = got.reasoning;
+            delete message.extra.pt_job;
+            try { c.updateMessageBlock?.(index, message); } catch (error) { logError('write-direct:render', error); }
+            try { if (events.MESSAGE_UPDATED) await emitter.emit(events.MESSAGE_UPDATED, index); } catch (error) { logError('write-direct:event', error); }
+            await c.saveChat();
+            log('write-direct', { s: sid(job.key), index, type: job.type });
+            drop(job);
+            notify('已把完整回复写入原来那条消息。');
+        } catch (error) { logError('write-direct', error); notify(`写入失败：${shortError(error)}`); }
     }
     function stopSession(session) {
         const job = session.job;
@@ -768,7 +844,7 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
             viewport: [host.innerWidth, host.innerHeight], visible: doc.visibilityState,
             mainApi: (() => { try { return ctx().mainApi; } catch { return null; } })(),
             group: !!current().group, current: sid(curKey),
-            state: { ...genState(), switching, switchingForMs: switching ? Date.now() - switchingSince : 0, reattachBusy, replayArmed: !!replayArm, fetchArmed: !!armed, fetchHooked: host.fetch === parallelFetch, hasPromptEvent: !!events.GENERATE_AFTER_DATA, launcherSide, panelOpen, drafts: drafts.size },
+            state: { ...genState(), switching, switchingForMs: switching ? Date.now() - switchingSince : 0, reattachBusy, replayArmed: !!replayArm, fetchArmed: !!armed, parallelOn: isOn(), fetchHooked: host.fetch === parallelFetch, hasPromptEvent: !!events.GENERATE_AFTER_DATA, launcherSide, panelOpen, drafts: drafts.size },
             sessions: [...sessions.values()].map(s => ({ s: sid(s.key), here: s.key === curKey, unread: s.unread,
                 job: s.job ? { type: s.job.type, status: s.job.status, attached: s.job.attached, detaching: s.job.detaching, http: s.job.head?.status ?? null, bytes: s.job.bytes, created: s.job.created, mismatch: !!s.job.mismatch } : null })),
             errors, log: logs.map(entry => entry.length > 2 ? `${entry[0]} ${entry[1]} ${JSON.stringify(entry[2])}` : `${entry[0]} ${entry[1]}`),
@@ -1048,14 +1124,15 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
         if (sure) node.classList.add('pt-danger');
         return node;
     }
-    function stateOf(session) {
+    function stateOf(session, detail = true) {
         const job = session.job, here = session.key === curKey;
         if (job && !job.attached) {
             if (job.status === 'running') {
+                if (!detail) return { state: 'busy', busy: true, label: '' };
                 const got = parsed(job);
                 return { state: 'busy', busy: true, label: got.text ? `后台生成中 · 已收到 ${got.text.length} 字` : got.reasoning ? `后台生成中 · 正在思考（${got.reasoning.length} 字）` : '后台生成中 · 等待首个字' };
             }
-            if (job.mismatch) return { state: 'error', label: '聊天已变化，未自动写入' };
+            if (job.mismatch) return { state: 'error', label: '未自动写入 · 点右侧“…”处理' };
             if (job.failure || job.head?.status >= 400) return { state: 'error', label: '生成失败 · 切回查看原因' };
             return { state: 'done', label: here ? '正在写回…' : job.truncated ? '已中断 · 切回写入已收到的部分' : '已完成 · 点击切回查看' };
         }
@@ -1077,19 +1154,19 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
     }
     function updateLauncher() {
         const all = [...sessions.values()];
-        const states = all.map(stateOf);
+        const states = all.map(session => stateOf(session, false));
         const running = states.filter(s => s.busy).length;
         const completed = all.filter(s => s.unread);
         const finished = completed.length > 0 || (!!fgFinishedKey && fgFinishedKey === curKey);
         launcher.dataset.state = running ? 'generating' : finished ? 'completed' : 'idle';
-        const sig = JSON.stringify([running, completed.length, all.map(s => [s.key, s.name])]);
+        const sig = JSON.stringify([isOn(), running, completed.length, all.map(s => [s.key, s.name])]);
         if (sig !== launcherSignature) {
             launcherSignature = sig;
             const dock = element('span', 'pt-dock'), faces = element('span', 'pt-dock-faces');
             for (const s of all) { const face = stablePortrait('dock:' + s.key, s); face.dataset.ptSession = s.key; faces.append(face); }
             if (!all.length) faces.append(portrait({ name: '并' }));
             const label = element('span', 'pt-dock-label', completed.length ? `${completed.length} 个已完成` : '并行会话');
-            label.append(element('span', 'pt-dock-note', running ? `${running} 个正在回复` : '点开查看会话'));
+            label.append(element('span', 'pt-dock-note', !isOn() ? '点击开启' : running ? `${running} 个正在回复` : '点开查看会话'));
             dock.append(faces, label);
             launcher.replaceChildren(dock);
         }
@@ -1126,11 +1203,21 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
         const heading = element('span', 'pt-heading', 'Parallel');
         heading.append(element('span', 'pt-subheading', '并 行 会 话'));
         const add = button('＋ 打开对话', showPicker, '打开对话'); add.classList.add('pt-add');
-        row.append(heading, add, iconButton('收起', 'minus', () => { panelOpen = false; render(); }));
+        row.append(heading, ...(isOn() ? [add] : []), iconButton('收起', 'minus', () => { panelOpen = false; render(); }));
         panel.append(row);
+        if (!isOn()) {
+            const welcome = element('div', 'pt-welcome');
+            welcome.append(element('p', 'pt-muted', '一个角色在回复，也能切去和另一个角色聊天。最多同时保留 3 个会话。不开启时就是普通聊天，本扩展不做任何处理。'));
+            welcome.append(button('开启角色并行', () => {
+                if (current().group) { notify('群聊暂不支持并行，请先打开一个单角色聊天。'); return; }
+                setEnabled(true);
+            }));
+            panel.append(welcome);
+            return;
+        }
         const all = [...sessions.values()];
         const overview = element('div', 'pt-overview');
-        overview.append(element('span', 'pt-live-count', `${all.filter(s => stateOf(s).busy).length} 正在回复`), element('span', 'pt-ready-count', `${all.filter(s => s.unread).length} 待查看`));
+        overview.append(element('span', 'pt-live-count', `${all.filter(s => stateOf(s, false).busy).length} 正在回复`), element('span', 'pt-ready-count', `${all.filter(s => s.unread).length} 待查看`));
         panel.append(overview);
         const section = element('div', 'pt-section-label', '对话'); section.append(element('span', '', `${sessions.size} / ${MAX_SESSIONS}`)); panel.append(section);
         const list = element('div', 'pt-session-list'); panel.append(list);
@@ -1153,6 +1240,7 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
             if (controlsKey === session.key) {
                 const controls = element('div', 'pt-actions');
                 if (status.busy) controls.append(button('停止生成', () => stopSession(session)));
+                if (job && !job.attached && job.status !== 'running' && job.head && job.mismatch && here && markedIndex(job) >= 0) controls.append(button('直接写入原消息', () => void writeDirect(job)));
                 if (job && !job.attached && job.status !== 'running' && job.head) controls.append(button('复制回复', () => void copyJob(job)));
                 if (job && !job.attached) { const discard = confirmButton('丢弃回复', '再点一次确认丢弃', 'discard:' + session.key, () => drop(job, { abort: true })); discard.classList.add('pt-danger'); controls.append(discard); }
                 if (!here) controls.append(job ? confirmButton('关闭会话', job.status === 'running' ? '后台回复会被丢弃，再点确认' : '未写回的回复会被丢弃，再点确认', 'close:' + session.key, () => closeSession(session)) : button('关闭会话', () => closeSession(session)));
@@ -1162,7 +1250,7 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
             list.append(card);
         }
         const footer = element('div', 'pt-footer');
-        footer.append(element('span', '', `v${VERSION} · 保持页面开启`), button('设置', () => { menuOpen = !menuOpen; render(); })); panel.append(footer);
+        footer.append(button('退出并行', () => setEnabled(false)), element('span', '', `v${VERSION}`), button('设置', () => { menuOpen = !menuOpen; render(); })); panel.append(footer);
         if (menuOpen) {
             const menu = element('div', 'pt-menu');
             const theme = button('夜间模式：' + (nightMode ? '开启' : '关闭'), () => setNightMode(!nightMode), '夜间模式');
@@ -1263,7 +1351,7 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
 
     // 生成中直接点原生角色列表，酒馆会拒绝切换；这里接管成“转入后台再切换”。
     const captureCharacterClick = event => {
-        if (!isGenerating() || !foregroundJob()) return;
+        if (!isOn() || !isGenerating() || switching) return;
         const target = event.target?.closest?.('.character_select[data-chid], .character_select[chid]');
         if (!target) return;
         const character = ctx().characters[Number(target.dataset.chid ?? target.getAttribute('chid'))];
@@ -1280,6 +1368,10 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
     doc.addEventListener('click', noteSendIntent, true);
     doc.addEventListener('keydown', noteSendIntent, true);
     teardown.push(() => { doc.removeEventListener('click', noteSendIntent, true); doc.removeEventListener('keydown', noteSendIntent, true); });
+
+    const onVisible = () => { if (doc.hidden || disposed) return; log('page:visible'); settle(); render(); scheduleReattach(300); };
+    doc.addEventListener('visibilitychange', onVisible);
+    teardown.push(() => doc.removeEventListener('visibilitychange', onVisible));
 
     const warnUnload = event => {
         if ([...jobs.values()].some(job => job.status === 'running' && !job.attached)) { event.preventDefault(); event.returnValue = ''; }
@@ -1301,6 +1393,8 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
         show() { if (launcherSide) expandLauncher(); panelOpen = true; pickerOpen = false; render(); },
         setLauncherVisible(value) { launcherVisible = value !== false; render(); },
         setNightMode,
+        setEnabled,
+        isEnabled: isOn,
         dispose,
         exportDiagnostics, diagnosticReport,
         getActiveWindow: () => host,
@@ -1309,7 +1403,7 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
     };
     host[KEY] = controller;
 
-    restore();
+    if (isOn()) restore();
     syncCurrent();
     try { profile = installProfiles?.(host, { busy: () => isGenerating() || !!replayArm, notify }) || null; } catch (error) { console.warn('[并行对话] 角色配置记忆未启用', error); }
     render();
