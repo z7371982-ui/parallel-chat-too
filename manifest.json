@@ -6,6 +6,7 @@
   "js": "index.js",
   "css": "style.css",
   "author": "Parallel Tavern",
-  "version": "0.6.8",
+  "version": "0.6.8-r2",
   "auto_update": false
 }
+

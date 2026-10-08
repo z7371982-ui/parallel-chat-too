@@ -1,11 +1,11 @@
-/* 并行对话 0.6.8 — 单页面后台生成。
+/* 并行对话 0.6.8-r2 — 单页面后台生成。
  *
  * 不再为每个会话启动第二个酒馆页面（iframe）。切换对话时，只把正在进行的
  * 生成请求留在后台继续接收；切回该对话后，由酒馆原生流程把保存下来的响应
  * 重新走一遍（正则、变量脚本、保存都是原生逻辑）。不自行拼接提示词，不直接
  * 写聊天文件，不保存 API 密钥。
  */
-const VERSION = '0.6.8';
+const VERSION = '0.6.8-r2';
 const KEY = '__PARALLEL_TAVERN_V2__';
 const MAX_SESSIONS = 3;
 const STORE = 'parallel-tavern.jobs.v1';
@@ -82,7 +82,7 @@ function signature(input, init) {
     return sig;
 }
 
-export function start({ settings, save, installProfiles, nativeBusy }) {
+export function start({ settings, save, installProfiles, nativeBusy, nativeSaving }) {
     const host = window, doc = document;
     if (host[KEY]) return host[KEY];
     const ctx = () => host.SillyTavern.getContext();
@@ -100,7 +100,7 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
     let quietPending = 0;
     let armed = null;             // 下一条生成请求由本扩展接管
     let replayArm = null;         // 切回后等待原生流程发起的那次请求
-    let switching = false, reattachBusy = false, reattachTimer = null;
+    let switching = false, pendingSwitch = null, reattachBusy = false, reattachTimer = null;
     let profile = null;
     // 并行开关：关闭时本扩展不接管任何请求、不建会话、不动草稿和滚动，就是普通聊天。
     const isOn = () => settings.parallelEnabled === true;
@@ -110,6 +110,7 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
     let lastGenStart = 0, dryActiveUntil = 0, sendIntentAt = 0;
     let fgFinishedKey = null, lastStoppedAt = 0;   // 前台生成刚结束（侧边小条显示绿色用）
     const drafts = new Map();                       // 每个会话各自的未发送草稿
+    let storageStatus = { state: 'empty', omitted: 0 };
 
     // ----- 诊断记录：只记步骤、状态和报错位置，不记聊天内容、角色名或密钥 -----
     const startedAt = Date.now();
@@ -178,6 +179,9 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
     }
     // 滑动生成被中断后，酒馆还要把滑动状态收尾；这期间不能切换聊天。
     const isSwiping = () => doc.body.dataset.swiping === 'true';
+    // Some hosts release the send button before streamed-message hooks and the
+    // final save finish. The processor is cleared only after those steps return.
+    const nativeStream = () => { try { return ctx().streamingProcessor || null; } catch { return null; } };
     const foregroundJob = () => [...jobs.values()].find(job => job.attached) || null;
     function ensureSession(info) {
         let session = sessions.get(info.key);
@@ -214,18 +218,23 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
     function persist() {
         try {
             const list = [];
-            let size = 0;
+            let size = 0, omitted = 0;
             for (const job of jobs.values()) {
                 if (job.attached || job.status === 'running' || !job.head) continue;
                 const body = bodyText(job);
+                if (size + body.length > STORE_LIMIT) { omitted++; continue; }
                 size += body.length;
-                if (size > STORE_LIMIT) break;
                 list.push({ id: job.id, key: job.key, avatar: job.avatar, name: job.name, chatId: job.chatId, type: job.type, sig: job.sig,
                     head: job.head, created: job.created, baseLength: job.baseLength, cont: job.cont, swipeIndex: job.swipeIndex, finishedAt: job.finishedAt, truncated: !!job.truncated, body });
             }
             if (list.length) host.localStorage.setItem(STORE, JSON.stringify(list));
             else host.localStorage.removeItem(STORE);
-        } catch { /* 存储不可用只影响刷新后的恢复 */ }
+            storageStatus = { state: omitted ? 'limited' : list.length ? 'saved' : 'empty', omitted };
+        } catch {
+            storageStatus = { state: 'failed', omitted: 0 };
+        }
+        // Keep this warning in the panel so a completion toast cannot hide it.
+        if (storageStatus.state === 'limited' || storageStatus.state === 'failed') queueRender();
     }
     function restore() {
         try {
@@ -251,7 +260,7 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
     function settle() {
         if (isGenerating()) return;
         for (const job of [...jobs.values()]) {
-            if (job.attached && !job.detaching && job.status !== 'running') drop(job);
+            if (job.attached && !job.detaching && !job.pendingDetach && job.status !== 'running') drop(job);
         }
     }
     function finish(job, error) {
@@ -506,6 +515,8 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
     async function detach(job) {
         if (!job.attached || job.detaching) return false;
         job.detaching = true;
+        const processor = nativeStream();
+        let completed = false;
         log('detach:start', { s: sid(job.key), type: job.type, bytes: job.bytes });
         let ended = false;
         const onEnded = () => { ended = true; };
@@ -513,8 +524,12 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
         try {
             ctx().stopGeneration();
             await waitFor(() => ended || (pressFlag() === false && !domGenerating()), 1200);
-            const idle = await waitFor(() => !isGenerating() && !isSwiping(), 8000);
-            if (!idle) log('detach:still-busy', genState());
+            const idle = await waitFor(() => !isGenerating() && !isSwiping() && (!processor || nativeStream() !== processor) && nativeSaving?.() !== true, 8000);
+            if (!idle) {
+                log('detach:still-busy', genState());
+                notify('酒馆还在处理这份回复，后台接收会继续；收尾完成后可再切换。');
+                return false;
+            }
             if (job.type === 'swipe') { await delay(150); await waitFor(() => !isSwiping(), 5000); }
             const c = ctx(), chat = c.chat, last = chat[chat.length - 1];
             if (current().key === job.key && last && !last.is_user) {
@@ -530,9 +545,13 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
                     try { await c.saveChat(); } catch { /* 原生保存失败时酒馆自己会提示 */ }
                 }
             }
+            completed = true;
         } finally {
             emitter.removeListener ? emitter.removeListener(events.GENERATION_ENDED, onEnded) : emitter.off?.(events.GENERATION_ENDED, onEnded);
-            job.attached = false; job.detaching = false; job.front = null; job.onHead = null; job.onFail = null;
+            // If native finalization timed out, retain ownership of this chat.
+            // A later attempt must mark the partial reply before replaying it.
+            job.pendingDetach = !completed;
+            job.attached = !completed; job.detaching = false; job.front = null; job.onHead = null; job.onFail = null;
         }
         if (job.status !== 'running') { const session = sessions.get(job.key); if (session?.job === job) session.unread = true; persist(); }
         log('detach:done', { s: sid(job.key), created: job.created, status: job.status });
@@ -578,9 +597,16 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
             if (last?.extra?.pt_job && !jobs.has(last.extra.pt_job)) delete last.extra.pt_job;
             return;
         }
+        if (job.pendingDetach) {
+            if (job.detaching || isGenerating() || isSwiping() || nativeStream() || nativeSaving?.() === true) { scheduleReattach(800); return; }
+            reattachBusy = true;
+            try { if (!(await detach(job))) { scheduleReattach(800); return; } }
+            finally { reattachBusy = false; }
+            if (disposed || switching || current().key !== job.key || session.job !== job) return;
+        }
         if (job.mismatch) return;
         if (job.attached || job.detaching || replayArm) return;
-        if (isGenerating() || isSwiping() || Date.now() - sendIntentAt < 1500) { scheduleReattach(800); return; }
+        if (isGenerating() || isSwiping() || nativeStream() || nativeSaving?.() === true || Date.now() - sendIntentAt < 1500) { scheduleReattach(800); return; }
         if (doc.getElementById('curEditTextarea')?.offsetParent) { scheduleReattach(1500); return; }
         // 聊天刚加载完酒馆会做一两次“试算提示词”，避开它正在进行的时刻。
         if (Date.now() < dryActiveUntil) { scheduleReattach(250); return; }
@@ -611,6 +637,7 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
                 // （切到后台、窗口被遮住）动画不走完，生成会一直卡在那一步。
                 if (typeof c.deleteLastMessage === 'function') {
                     await c.deleteLastMessage();
+                    if (disposed || current().key !== job.key || session.job !== job) return;
                     job.created = false;
                     const now = ctx().chat;
                     if (now.length === job.baseLength) mode = now[now.length - 1]?.is_user ? 'regenerate' : 'normal';
@@ -672,9 +699,8 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
     async function openSession(target) {
         if (disposed) return;
         if (switching) {
-            // 上一次切换若超过 50 秒还没结束，视为卡死并放行，避免之后所有点击都没反应。
-            if (Date.now() - switchingSince < 50000) { log('switch:ignored-busy'); notify('正在切换，请稍等。'); return; }
-            log('switch:force-reset');
+            // One native chat switch at a time, including slow save/replay.
+            pendingSwitch = target; log('switch:queued'); return;
         }
         switching = true; switchingSince = Date.now();
         const known = target.chatId ? target.avatar + '\n' + target.chatId : [...sessions.keys()].find(key => key.startsWith(target.avatar + '\n'));
@@ -691,7 +717,15 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
                 notify(`已经有 ${MAX_SESSIONS} 个会话了。请先在面板里点会话右侧的“…”关闭一个，再打开新的。`);
                 return;
             }
-            if (replayArm) { log('switch:blocked-replay'); notify('正在写回后台回复，请稍等几秒再切换。'); return; }
+            if (reattachBusy || replayArm) {
+                // Keep this selection while the previous chat is preparing its
+                // native replay. Once attached, detach that same live response
+                // normally; never start a second request or change chat mid-save.
+                log('switch:wait-replay');
+                const ready = await waitFor(() => disposed || (!reattachBusy && !replayArm), 47000);
+                if (disposed) return;
+                if (!ready) { log('switch:replay-timeout'); notify('酒馆仍在接回后台回复，请稍后再切换。后台生成会继续。'); return; }
+            }
             if (Date.now() - sendIntentAt < 1500 && !isGenerating()) {
                 // 刚按下发送：等酒馆把这次生成立起来，否则消息会被发到切换后的聊天里。
                 log('switch:wait-send');
@@ -709,10 +743,15 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
                 unstick('stale-flag');
                 await delay(100);
             }
-            if (isGenerating()) {
+            if (isGenerating() || foregroundJob()?.pendingDetach) {
                 const job = foregroundJob();
                 if (!job) { log('switch:blocked-untracked', genState()); notify(sessions.get(curKey)?.job ? '这个对话还有一条没处理的后台回复（在面板里复制或丢弃它），所以这次新的生成不能转入后台。请等待完成或先停止。' : curKey && !sessions.has(curKey) ? `当前对话不在 ${MAX_SESSIONS} 个并行会话里，这次生成不能转入后台。请等待完成或先停止。` : '当前这次生成无法转入后台（群聊、扩展自己的请求或不支持的接口）。请等待完成或先停止。'); return; }
                 if (!(await detach(job))) { log('switch:detach-refused'); return; }
+            }
+            if (nativeStream() || nativeSaving?.() === true) {
+                log('switch:wait-save');
+                const idle = await waitFor(() => !isGenerating() && !isSwiping() && !nativeStream() && nativeSaving?.() !== true, 8000);
+                if (!idle) { notify('酒馆还在处理这份回复，请等收尾完成后再切换。后台生成会继续。'); return; }
             }
             const c = ctx();
             const index = c.characters.findIndex(character => character?.avatar === target.avatar);
@@ -755,7 +794,10 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
             logError('switch', error);
             notify(`切换失败：${shortError(error)}`);
         } finally {
-            switching = false; syncCurrent(); render(); scheduleReattach(400);
+            switching = false; syncCurrent(); render();
+            const next = pendingSwitch; pendingSwitch = null;
+            if (next && !disposed) void openSession(next);
+            else scheduleReattach(400);
         }
     }
     async function chatExists(character, chatId) {
@@ -788,7 +830,7 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
     async function writeDirect(job) {
         try {
             if (current().key !== job.key) { notify('请先切到这份聊天再写入。'); return; }
-            if (isGenerating()) { notify('酒馆正在生成，请等它结束再写入。'); return; }
+            if (isGenerating() || nativeStream() || nativeSaving?.() === true || job.pendingDetach) { notify('酒馆正在生成或处理回复，请等它结束再写入。'); return; }
             const c = ctx(), index = markedIndex(job), got = parsed(job), text = String(got.text || '').trim();
             if (index < 0 || !text) { notify('没有找到可写入的位置或文本，可以改用“复制回复”。'); return; }
             const message = c.chat[index];
@@ -814,7 +856,7 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
     }
     function stopSession(session) {
         const job = session.job;
-        if (session.key === curKey && (!job || job.attached)) { try { ctx().stopGeneration(); } catch (error) { notify(`停止失败：${shortError(error)}`); } return; }
+        if (session.key === curKey && (!job || (job.attached && !job.pendingDetach))) { try { ctx().stopGeneration(); } catch (error) { notify(`停止失败：${shortError(error)}`); } return; }
         if (job?.status === 'running') {
             if (!job.head) { drop(job, { abort: true }); notify('已停止，这次回复还没有收到内容。'); return; }
             // 保留已收到的部分，切回后照常写入。
@@ -845,6 +887,7 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
             mainApi: (() => { try { return ctx().mainApi; } catch { return null; } })(),
             group: !!current().group, current: sid(curKey),
             state: { ...genState(), switching, switchingForMs: switching ? Date.now() - switchingSince : 0, reattachBusy, replayArmed: !!replayArm, fetchArmed: !!armed, parallelOn: isOn(), fetchHooked: host.fetch === parallelFetch, hasPromptEvent: !!events.GENERATE_AFTER_DATA, launcherSide, panelOpen, drafts: drafts.size },
+            replyStorage: { ...storageStatus },
             sessions: [...sessions.values()].map(s => ({ s: sid(s.key), here: s.key === curKey, unread: s.unread,
                 job: s.job ? { type: s.job.type, status: s.job.status, attached: s.job.attached, detaching: s.job.detaching, http: s.job.head?.status ?? null, bytes: s.job.bytes, created: s.job.created, mismatch: !!s.job.mismatch } : null })),
             errors, log: logs.map(entry => entry.length > 2 ? `${entry[0]} ${entry[1]} ${JSON.stringify(entry[2])}` : `${entry[0]} ${entry[1]}`),
@@ -892,6 +935,12 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
     let launcherVisible = settings.showLauncher !== false;
     let panelOpen = false, pickerOpen = false, menuOpen = false, controlsKey = null;
     let launcherSide = null, launcherSignature = '', badgeSignature = '';
+    let launcherRatio = 0.5;
+    try {
+        const dock = JSON.parse(host.localStorage.getItem('parallel-tavern.launcher-dock') || 'null');
+        if (['left', 'right'].includes(dock?.side)) launcherSide = dock.side;
+        if (Number.isFinite(dock?.ratio)) launcherRatio = Math.max(0, Math.min(1, dock.ratio));
+    } catch { /* default position */ }
     let renderPending = false, pointerActive = false, toastTimer;
     const element = (tag, className, text) => {
         const node = doc.createElement(tag);
@@ -938,7 +987,7 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
         return face;
     }
     const launcher = button('并行', event => {
-        if (launcherSide) { expandLauncher(); return; }
+        if (launcherSide) { expandLauncher(); panelOpen = true; pickerOpen = false; render(); return; }
         if (settings.avatarQuickSwitch === true && event.detail > 0) {
             const face = [...launcher.querySelectorAll('[data-pt-session]')].reverse().find(node => {
                 const r = node.getBoundingClientRect();
@@ -950,6 +999,7 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
         panelOpen = !panelOpen; pickerOpen = false; render();
     });
     launcher.id = 'pt-launcher'; launcher.dataset.ttMobileSurface = 'free-window';
+    if (launcherSide) { launcher.dataset.side = launcherSide; launcher.dataset.ptDragged = 'true'; }
     const completionBadge = element('span'); completionBadge.id = 'pt-completion-badge'; completionBadge.hidden = true; completionBadge.setAttribute('aria-hidden', 'true');
     const panel = element('section'); panel.id = 'pt-panel'; panel.hidden = true;
     panel.setAttribute('aria-label', '并行角色会话'); panel.dataset.ttMobileSurface = 'free-window';
@@ -993,15 +1043,22 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
             if (node !== toast) node.style.setProperty('transform', 'none', 'important');
         }
     }
+    function saveLauncherDock() {
+        try { host.localStorage.setItem('parallel-tavern.launcher-dock', JSON.stringify({ side: launcherSide, ratio: launcherRatio })); } catch { /* optional */ }
+    }
     function dockLauncher(side) {
+        const b = floatingBounds(), r = launcher.getBoundingClientRect();
+        launcherRatio = Math.max(0, Math.min(1, (r.top + r.height / 2 - b.top) / Math.max(1, b.bottom - b.top)));
         launcherSide = side; launcher.dataset.side = side; launcher.dataset.ptDragged = 'true';
-        panelOpen = false; pickerOpen = false; render();
+        saveLauncherDock(); panelOpen = false; pickerOpen = false; render();
     }
     function expandLauncher() {
         const side = launcherSide;
         launcherSide = null; delete launcher.dataset.side;
+        saveLauncherDock();
         const b = floatingBounds();
         launcher.style.setProperty('left', `${side === 'left' ? b.left : b.right - launcher.offsetWidth}px`, 'important');
+        launcher.style.setProperty('top', `${Math.max(b.top, Math.min(b.bottom - launcher.offsetHeight, b.top + launcherRatio * (b.bottom - b.top) - launcher.offsetHeight / 2))}px`, 'important');
         launcherSignature = ''; render();
     }
     function draggable(node, handle) {
@@ -1023,6 +1080,10 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
             drag.moved = true; e.preventDefault();
             node.dataset.ptDragged = 'true';
             const bounds = floatingBounds();
+            if (node === launcher && launcherSide) {
+                launcherRatio = Math.max(0, Math.min(1, (drag.top + node.offsetHeight / 2 + dy - bounds.top) / Math.max(1, bounds.bottom - bounds.top)));
+                keepFloatingVisible(); return;
+            }
             const left = node === launcher && launcherSide ? (launcherSide === 'left' ? bounds.left : bounds.right - node.offsetWidth)
                 : Math.max(bounds.left, Math.min(bounds.right - node.offsetWidth, drag.left + dx));
             const top = Math.max(bounds.top, Math.min(bounds.bottom - node.offsetHeight, drag.top + dy));
@@ -1040,6 +1101,7 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
                 if (finished.side && (finished.side === 'left' ? dx > 0 : dx < 0)) expandLauncher();
                 else if (!finished.side && finished.edge && (finished.edge === 'left' ? dx < 0 : dx > 0)) dockLauncher(finished.edge);
             }
+            if (finished.side) saveLauncherDock();
             keepFloatingVisible();
         });
         const cancelDrag = e => {
@@ -1065,6 +1127,12 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
             if (node === panel) { set(node, 'width', `${Math.min(364, width)}px`); set(node, 'max-height', `${Math.max(1, height - panelReserve)}px`); }
             if (node.hidden || !node.offsetHeight) continue;
             const rect = node.getBoundingClientRect();
+            if (node === launcher && launcherSide) {
+                set(node, 'top', `${Math.max(b.top, Math.min(b.bottom - rect.height, b.top + launcherRatio * height - rect.height / 2))}px`);
+                set(node, 'left', `${launcherSide === 'left' ? b.left - 12 : b.right + 12 - rect.width}px`);
+                set(node, 'right', 'auto'); set(node, 'bottom', 'auto'); set(node, 'margin', '0px');
+                continue;
+            }
             const preferredTop = node.dataset.ptDragged ? rect.top : b.bottom - rect.height - (node === panel ? panelReserve : compact ? 0 : 76);
             const top = Math.max(b.top, Math.min(b.bottom - rect.height, preferredTop));
             const left = node === launcher && launcherSide ? (launcherSide === 'left' ? b.left : b.right - rect.width)
@@ -1126,7 +1194,7 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
     }
     function stateOf(session, detail = true) {
         const job = session.job, here = session.key === curKey;
-        if (job && !job.attached) {
+        if (job && (!job.attached || job.pendingDetach)) {
             if (job.status === 'running') {
                 if (!detail) return { state: 'busy', busy: true, label: '' };
                 const got = parsed(job);
@@ -1141,7 +1209,7 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
     }
     function preview(session) {
         try {
-            if (session.job && !session.job.attached) {
+            if (session.job && (!session.job.attached || session.job.pendingDetach)) {
                 const { text, reasoning } = parsed(session.job);
                 if (text || reasoning) return (text || reasoning).slice(-200);
             }
@@ -1217,6 +1285,11 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
         }
         const all = [...sessions.values()];
         const overview = element('div', 'pt-overview');
+        if (storageStatus.state === 'failed' || storageStatus.state === 'limited') {
+            panel.append(element('p', 'pt-error pt-storage-warning', storageStatus.state === 'failed'
+                ? '后台回复未能保存到本设备，刷新后可能丢失。请先切回写入或复制回复。'
+                : `有 ${storageStatus.omitted} 条后台回复超过本地保存容量，刷新后可能丢失。请先切回写入或复制回复。`));
+        }
         overview.append(element('span', 'pt-live-count', `${all.filter(s => stateOf(s, false).busy).length} 正在回复`), element('span', 'pt-ready-count', `${all.filter(s => s.unread).length} 待查看`));
         panel.append(overview);
         const section = element('div', 'pt-section-label', '对话'); section.append(element('span', '', `${sessions.size} / ${MAX_SESSIONS}`)); panel.append(section);
@@ -1253,6 +1326,7 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
         footer.append(button('退出并行', () => setEnabled(false)), element('span', '', `v${VERSION}`), button('设置', () => { menuOpen = !menuOpen; render(); })); panel.append(footer);
         if (menuOpen) {
             const menu = element('div', 'pt-menu');
+            menu.append(button('收至左侧', () => dockLauncher('left')), button('收至右侧', () => dockLauncher('right')));
             const theme = button('夜间模式：' + (nightMode ? '开启' : '关闭'), () => setNightMode(!nightMode), '夜间模式');
             theme.setAttribute('role', 'switch'); theme.setAttribute('aria-checked', String(nightMode));
             const sound = button(`完成提示音：${soundEnabled ? '开启' : '关闭'}`, () => {
@@ -1351,11 +1425,11 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
 
     // 生成中直接点原生角色列表，酒馆会拒绝切换；这里接管成“转入后台再切换”。
     const captureCharacterClick = event => {
-        if (!isOn() || !isGenerating() || switching) return;
+        if (!isOn() || !(isGenerating() || switching || reattachBusy || replayArm || nativeStream() || nativeSaving?.() === true || foregroundJob()?.pendingDetach)) return;
         const target = event.target?.closest?.('.character_select[data-chid], .character_select[chid]');
         if (!target) return;
         const character = ctx().characters[Number(target.dataset.chid ?? target.getAttribute('chid'))];
-        if (!character?.avatar || character.avatar === current().avatar) return;
+        if (!character?.avatar || (character.avatar === current().avatar && !switching)) return;
         event.preventDefault(); event.stopImmediatePropagation();
         void openSession({ avatar: character.avatar });
     };
@@ -1363,6 +1437,31 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
     teardown.push(() => doc.removeEventListener('click', captureCharacterClick, true));
 
     const noteSendIntent = event => {
+        // A returned chat can still have a detached response waiting for the
+        // scheduled native replay. Starting another manual generation here would
+        // fall through intercept() as an untracked request and block switching.
+        // Allow the replay trigger itself, but keep user actions waiting until
+        // that original response is attached or explicitly handled.
+        const wantsGeneration = event.type === 'click'
+            ? event.target?.closest?.('#send_but, #option_regenerate, #option_continue, #chat .swipe_right')
+            : event.target?.id === 'send_textarea' && event.key === 'Enter' && !event.shiftKey && !event.isComposing;
+        const job = isOn() ? sessions.get(current().key)?.job : null;
+        const nativeReplayClick = event.type === 'click' && !event.isTrusted && !!replayArm && replayArm.job === job;
+        if (wantsGeneration && isOn() && !nativeReplayClick && (switching || reattachBusy || job?.pendingDetach || (!isGenerating() && nativeStream()))) {
+            event.preventDefault(); event.stopImmediatePropagation();
+            log('send:blocked-handoff');
+            notify('正在切换或处理回复，请稍后再发送；输入内容会保留。');
+            return;
+        }
+        if (wantsGeneration && job && !job.attached && !nativeReplayClick) {
+            event.preventDefault(); event.stopImmediatePropagation();
+            log('send:blocked-pending-reply', { s: sid(job.key), replay: !!replayArm, mismatch: !!job.mismatch });
+            if (!job.mismatch) {
+                scheduleReattach(50);
+                notify('这份聊天的后台回复正在接回，请稍后再发送；仍可切换其他会话。');
+            } else notify('这份聊天的后台回复尚未处理，请先写入或丢弃；也可先复制备份，仍可切换其他会话。');
+            return;
+        }
         if (event.type === 'click' ? event.target?.closest?.('#send_but') : event.target?.id === 'send_textarea' && event.key === 'Enter' && !event.shiftKey && !event.isComposing) sendIntentAt = Date.now();
     };
     doc.addEventListener('click', noteSendIntent, true);
@@ -1374,7 +1473,7 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
     teardown.push(() => doc.removeEventListener('visibilitychange', onVisible));
 
     const warnUnload = event => {
-        if ([...jobs.values()].some(job => job.status === 'running' && !job.attached)) { event.preventDefault(); event.returnValue = ''; }
+        if ([...jobs.values()].some(job => job.status === 'running' && (!job.attached || job.pendingDetach))) { event.preventDefault(); event.returnValue = ''; }
     };
     host.addEventListener('beforeunload', warnUnload);
     teardown.push(() => host.removeEventListener('beforeunload', warnUnload));
@@ -1383,7 +1482,7 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
         if (disposed) return;
         disposed = true;
         host.clearTimeout(reattachTimer); host.clearTimeout(toastTimer); releaseReplay();
-        for (const job of jobs.values()) if (job.status === 'running' && !job.attached) { try { job.ac.abort(); } catch { /* ignore */ } }
+        for (const job of jobs.values()) if (job.status === 'running' && (!job.attached || job.pendingDetach)) { try { job.ac.abort(); } catch { /* ignore */ } }
         profile?.dispose?.();
         for (const clean of teardown.splice(0)) { try { clean(); } catch { /* 逐项隔离 */ } }
         if (host[KEY] === controller) delete host[KEY];
@@ -1405,8 +1504,9 @@ export function start({ settings, save, installProfiles, nativeBusy }) {
 
     if (isOn()) restore();
     syncCurrent();
-    try { profile = installProfiles?.(host, { busy: () => isGenerating() || !!replayArm, notify }) || null; } catch (error) { console.warn('[并行对话] 角色配置记忆未启用', error); }
+    try { profile = installProfiles?.(host, { busy: () => isGenerating() || !!replayArm || !!nativeStream() || nativeSaving?.() === true, notify }) || null; } catch (error) { console.warn('[并行对话] 角色配置记忆未启用', error); }
     render();
     scheduleReattach(800);
     return controller;
 }
+
