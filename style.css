@@ -122,5 +122,3 @@
 #pt-panel[data-night="true"] .pt-actions .pt-danger{color:#ffb3b3}
 #pt-panel .pt-card[data-state="error"] .pt-status{color:#a45758}
 #pt-launcher[hidden]{display:none!important}
-#pt-launcher{width:max-content;box-sizing:border-box}
-#pt-panel .pt-storage-warning{margin:10px 20px;font-size:12px;line-height:1.6}

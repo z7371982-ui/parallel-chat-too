@@ -6,7 +6,7 @@ import { start } from './runtime.js';
 
 const KEY = 'parallel_tavern';
 const CONTROLLER = '__PARALLEL_TAVERN_V2__';
-const VERSION = '0.6.8-r2';
+const VERSION = '0.6.9';
 let startupError = '';
 
 void initialize().catch(error => {
@@ -44,12 +44,12 @@ async function initialize() {
                     <span>显示悬浮窗</span>
                 </label>
                 <small>关闭后隐藏悬浮入口；后台回复仍会继续接收。</small>
-                <small>拖到左侧后向左滑、拖到右侧后向右滑，可缩成侧边小条。黄色表示正在生成，绿色表示生成已完成；点击展开，位置在刷新后保留。</small>
+                <small>拖到左侧后向左滑、拖到右侧后向右滑，可缩成侧边小条。黄色表示正在生成，绿色表示有回复待查看。</small>
                 <label class="checkbox_label" for="pt-extension-avatar-switch"><input id="pt-extension-avatar-switch" type="checkbox"><span>点击悬浮头像切换对话</span></label>
                 <small>默认关闭。开启后点击头像直达对应对话，点击文字区域仍打开面板。</small>
                 <label class="checkbox_label" for="pt-extension-night"><input id="pt-extension-night" type="checkbox"><span>夜间模式</span></label>
-                <label class="checkbox_label" for="pt-extension-character-settings"><input id="pt-extension-character-settings" type="checkbox"><span>按角色记住预设、模型与代理</span></label>
-                <small>记住每个角色最后一次用的预设、接口类型和模型，下次切到这个角色时恢复。在角色里随时可以改，改了就以新的为准，不会被改回去。同一角色的不同聊天共用。同时记住原生代理预设、地址和密码，保存在酒馆扩展设置中。旧角色需重新选择一次正确代理；服务商 API 密钥仍由酒馆管理。</small>
+                <label class="checkbox_label" for="pt-extension-character-settings"><input id="pt-extension-character-settings" type="checkbox"><span>按角色记住预设与模型</span></label>
+                <small>记住每个角色最后一次用的预设、接口类型和模型，下次切到这个角色时恢复。在角色里随时可以改，改了就以新的为准，不会被改回去。同一角色的不同聊天共用。不复制 API 密钥或预设文件。</small>
                 <div class="flex-container"><button type="button" class="menu_button" id="pt-extension-open">打开并行面板</button><button type="button" class="menu_button" id="pt-extension-diagnostics">复制诊断</button></div>
                 <small>切换卡住或没反应时，先复现一次，再点“复制诊断”把内容发给作者。不含聊天内容、角色名和密钥。</small>
                 <small id="pt-extension-status" role="status"></small>
@@ -101,14 +101,17 @@ async function initialize() {
         status.textContent = '检测到旧版并行脚本仍在运行。请停用旧脚本并刷新，新版才会接管。';
         return;
     }
+    // 正则引擎用于处理思考内容；路径或导出不同的宿主上缺失也不影响启动。
+    let regexEngine = null;
+    try { regexEngine = await import('../../regex/engine.js'); } catch { /* optional */ }
     start({
         settings,
+        nativeCore: core,
+        regexEngine,
         save: saveSettingsDebounced,
         // 实时读取酒馆的“正在生成”标志（模块导出是活绑定）。旧宿主没有导出时返回 undefined，运行时会退回看界面。
         nativeBusy: () => core.is_send_press,
-        nativeSaving: () => core.isChatSaving,
         installProfiles: (win, options) => installCharacterProfiles(win, { ...options, settings, save: saveSettingsDebounced }),
     });
     controller()?.setLauncherVisible(settings.showLauncher);
 }
-
